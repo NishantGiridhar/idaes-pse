@@ -13,30 +13,20 @@
 """
 Interface for importing Keras models into IDAES
 """
-from enum import Enum
+import numpy as np
 import json
 import os.path
 
-import numpy as np
-import pandas as pd
-
 from pyomo.common.dependencies import attempt_import
 keras, keras_available = attempt_import('tensorflow.keras')
-omlt, omlt_available = attempt_import("omlt")
 
-if omlt_available:
-    from omlt import OmltBlock, OffsetScaling
-    from omlt.neuralnet import (
-        FullSpaceContinuousFormulation,
-        ReducedSpaceContinuousFormulation,
-        ReLUBigMFormulation,
-        ReLUComplementarityFormulation,
-        load_keras_sequential
-    )
-
+from enum import Enum
+import pandas as pd
 from idaes.surrogate.base.surrogate_base import SurrogateBase
 from idaes.surrogate.sampling.scaling import OffsetScaler
-
+from omlt import OmltBlock, OffsetScaling
+from omlt.neuralnet import (FullSpaceContinuousFormulation, ReducedSpaceContinuousFormulation,
+                            ReLUBigMFormulation, ReLUComplementarityFormulation, load_keras_sequential)
 
 class KerasSurrogate(SurrogateBase):
     def __init__(self, keras_model, input_labels, output_labels, input_bounds,

@@ -31,7 +31,8 @@ class UnitCell(object):
     def isConsistentWithDesign(self):
         for Position in self.FracPositions:
             for coord in Position:
-                if coord < 0.0 - UnitCell.DBL_TOL or coord > 1.0 + UnitCell.DBL_TOL:
+                if (coord < 0.0 - UnitCell.DBL_TOL or
+                        coord > 1.0 + UnitCell.DBL_TOL):
                     return False
         return True
 
@@ -55,9 +56,10 @@ class UnitCell(object):
         return self._FracPositions
 
     def convertToFrac(self, P, blnDiscardIntPart=True):
-        P[:] = self.Tiling.getFractionalCoords(
-            P, blnRelativeToCenter=False, blnRoundInside=True, blnPreferZero=True
-        )
+        P[:] = self.Tiling.getFractionalCoords(P,
+                                               blnRelativeToCenter=False,
+                                               blnRoundInside=True,
+                                               blnPreferZero=True)
         if blnDiscardIntPart:
             P -= P.astype(int)
 
@@ -81,12 +83,10 @@ class UnitCellLattice(Lattice):
             for n2 in range(RefScanMin[1], RefScanMax[1] + 1):
                 for n3 in range(RefScanMin[2], RefScanMax[2] + 1):
                     for FracPart in self.RefUnitCell.FracPositions:
-                        yield (
-                            n1 * self.RefUnitCell.Tiling.TileShape.Vx
-                            + n2 * self.RefUnitCell.Tiling.TileShape.Vy
-                            + n3 * self.RefUnitCell.Tiling.TileShape.Vz
-                            + FracPart
-                        )
+                        yield (n1 * self.RefUnitCell.Tiling.TileShape.Vx +
+                               n2 * self.RefUnitCell.Tiling.TileShape.Vy +
+                               n3 * self.RefUnitCell.Tiling.TileShape.Vz +
+                               FracPart)
 
     def Scan(self, argPolyhedron):
         RefScanMin = self._getConvertToReference(argPolyhedron.V[0])
@@ -106,10 +106,7 @@ class UnitCellLattice(Lattice):
 
     # === PROPERTY EVALUATION METHODS
     def isOnLattice(self, P):
-        return (
-            self.RefUnitCell.getPointType(Lattice._getConvertToReference(self, P))
-            is not None
-        )
+        return self.RefUnitCell.getPointType(Lattice._getConvertToReference(self, P)) is not None
 
     @abstractmethod
     def areNeighbors(self, P1, P2):

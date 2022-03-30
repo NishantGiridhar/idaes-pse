@@ -1,15 +1,15 @@
-#################################################################################
+###############################################################################
 # The Institute for the Design of Advanced Energy Systems Integrated Platform
 # Framework (IDAES IP) was produced under the DOE Institute for the
 # Design of Advanced Energy Systems (IDAES), and is copyright (c) 2018-2021
 # by the software owners: The Regents of the University of California, through
 # Lawrence Berkeley National Laboratory,  National Technology & Engineering
-# Solutions of Sandia, LLC, Carnegie Mellon University, West Virginia University
-# Research Corporation, et al.  All rights reserved.
+# Solutions of Sandia, LLC, Carnegie Mellon University,
+# West Virginia University Research Corporation, et al.  All rights reserved.
 #
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and
 # license information.
-#################################################################################
+###############################################################################
 """
 IDAES Moving Bed Model.
 
@@ -50,13 +50,13 @@ from idaes.core import (ControlVolume1DBlock,
                         MaterialBalanceType,
                         EnergyBalanceType,
                         MomentumBalanceType,
-                        FlowDirection,
-                        DistributedVars)
+                        FlowDirection)
 from idaes.core.util.config import (is_physical_parameter_block,
                                     is_reaction_parameter_block)
 from idaes.core.util.exceptions import (ConfigurationError,
                                         BurntToast)
 from idaes.core.util.tables import create_stream_table_dataframe
+from idaes.core.control_volume1d import DistributedVars
 from idaes.core.util.constants import Constants as constants
 from idaes.core.util.math import smooth_abs
 import idaes.logger as idaeslog

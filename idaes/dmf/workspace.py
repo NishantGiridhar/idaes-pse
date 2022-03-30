@@ -324,7 +324,7 @@ class Workspace(object):
         # Return modified configuration metadata
         return d
 
-    def get_doc_paths(self) -> List[str]:
+    def get_doc_paths(self):
         """Get paths to generated HTML Sphinx docs.
 
         Returns:

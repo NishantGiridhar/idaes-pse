@@ -42,7 +42,8 @@ def pipeline(*commands, **params):
 
 
 def run_apidoc(clean=True, dry_run=False, **kwargs):
-    """Run the sphinx-apidoc extension to build API docs."""
+    """Run the sphinx-apidoc extension to build API docs.
+    """
     if clean and not dry_run:
         # remove old docs
         print_status("Remove old docs")
@@ -62,14 +63,15 @@ def run_apidoc(clean=True, dry_run=False, **kwargs):
             "../idaes/*tests*",
         ],
         60,
-        dry_run,
+        dry_run
     )
     if not dry_run:
         postprocess_apidoc(Path("apidoc"))
 
 
 def postprocess_apidoc(root):
-    """Perform postprocessing on generated apidoc files"""
+    """Perform postprocessing on generated apidoc files
+    """
     # Remove :noindex: from all entries in given modules
     remove_noindex = ["idaes.dmf"]
     for module in remove_noindex:
@@ -89,8 +91,9 @@ def postprocess_apidoc(root):
                     output_file.write(line)
 
 
-def run_html(clean=True, vb=0, timeout=0, dry_run=False, nprocs=1, **kwargs):
-    """Run sphinx-build to create HTML."""
+def run_html(clean=True, vb=0, timeout=0, dry_run=False, **kwargs):
+    """Run sphinx-build to create HTML.
+    """
     build_dir = "build"
     output_file = "sphinx-errors.txt"
     if not dry_run:
@@ -101,29 +104,17 @@ def run_html(clean=True, vb=0, timeout=0, dry_run=False, nprocs=1, **kwargs):
         if os.path.exists(output_file):
             os.unlink(output_file)
     # run
+    print_status("Run sphinx-build")
     if vb > 0:
         verbosity = "-" + "v" * vb
     else:
         verbosity = "-q"
-    if nprocs <= 0:
-        nprocs_arg = "-j auto"
-    elif nprocs == 1:
-        nprocs_arg = ""
-    else:
-        nprocs_arg = f"-j {nprocs}"
-    args = [
-        "sphinx-build",
-        "-M",
+    _run(
         "html",
-        ".",
-        build_dir,
-        "-w",
-        output_file,
-        nprocs_arg,
-        verbosity,
-    ]
-    print_status(f"Run: {' '.join(args)}")
-    _run("html", args, timeout, dry_run)
+        ["sphinx-build", "-M", "html", ".", build_dir, "-w", output_file] + [verbosity],
+        timeout,
+        dry_run
+    )
     if dry_run:
         return
     # check output file
@@ -146,8 +137,9 @@ def run_html(clean=True, vb=0, timeout=0, dry_run=False, nprocs=1, **kwargs):
 
 
 def _run(what, args, timeout, not_really):
-    """Run a command with a timeout."""
-    command_line = " ".join(args)
+    """Run a command with a timeout.
+    """
+    command_line = ' '.join(args)
     if not_really:
         print(f"Command: {command_line}")
         return
@@ -185,7 +177,8 @@ def print_error(cmd, msg):
 
 
 def main() -> int:
-    """Entry point for this module."""
+    """Entry point for this module.
+    """
     prs = argparse.ArgumentParser(description=__doc__.strip())
     prs.add_argument(
         "--dirty",
@@ -198,13 +191,6 @@ def main() -> int:
         action="store_true",
         dest="dry_run",
         help="Show commands to be executed",
-    )
-    prs.add_argument(
-        "-j",
-        dest="nprocs",
-        help="Number of processors, like argument of same name for sphinx-build",
-        default=1,
-        type=int,
     )
     prs.add_argument(
         "-t",
@@ -229,13 +215,8 @@ def main() -> int:
         verbosity = args.vb
     try:
         pipeline(
-            "apidoc",
-            "html",
-            clean=not args.dirty,
-            vb=verbosity,
-            timeout=args.timeout,
-            dry_run=args.dry_run,
-            nprocs=args.nprocs,
+            "apidoc", "html", clean=not args.dirty, vb=verbosity, timeout=args.timeout,
+            dry_run=args.dry_run
         )
     except CommandError as err:
         print_error(err.command, err.message)

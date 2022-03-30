@@ -22,7 +22,7 @@ callback from the user.
 from pyomo.network import Port
 from pyomo.common.config import ConfigValue, In
 
-from idaes.core.base.process_base import declare_process_block_class, \
+from idaes.core.process_base import declare_process_block_class, \
     ProcessBlockData
 from idaes.core.util.exceptions import ConfigurationError
 from idaes.core.util.model_statistics import degrees_of_freedom
@@ -117,7 +117,6 @@ class SkeletonUnitModelData(ProcessBlockData):
             p.add(member_dict[k], name=k)
 
 
-    # TODO : Work out how to make this work with new UnitModel initialization
     def initialize(self, outlvl=idaeslog.NOTSET,
                    solver=None, optarg=None, initial_guess=None):
         """Initialize method for the SkeletonUnitModel. If a custom function

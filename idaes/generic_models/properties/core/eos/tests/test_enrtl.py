@@ -190,7 +190,7 @@ class TestParameters(object):
         caplog.set_level(
             idaeslog.INFO,
             logger=("idaes.generic_models.properties.core."
-                    "eos.enrtl_parameters"))
+                    "generic.generic_property"))
 
         test_config = dict(configuration)
         test_config["parameter_data"] = {}

@@ -2,9 +2,9 @@ Boiler Fire Side Model
 ======================
 
 .. index::
-  pair: idaes.models_extra.power_generation.unit_models.boiler_fireside;BoilerFireside
+  pair: idaes.power_generation.unit_models.boiler_fireside;BoilerFireside
 
-.. currentmodule:: idaes.models_extra.power_generation.unit_models.boiler_fireside
+.. currentmodule:: idaes.power_generation.unit_models.boiler_fireside
 
 Introduction
 ------------

@@ -10,4 +10,3 @@ Data Management Framework
     dmf-overview
     dmf-cli
     dmf-api
-    dmf-tables

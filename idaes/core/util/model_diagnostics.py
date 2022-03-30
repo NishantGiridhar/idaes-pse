@@ -21,10 +21,13 @@ import pyomo.environ as pyo
 from pyomo.core.expr.visitor import identify_variables
 from pyomo.contrib.pynumero.interfaces.pyomo_nlp import PyomoNLP
 import numpy as np
+from scipy.linalg  import svd
 from scipy.sparse.linalg import svds
 from scipy.sparse import issparse, find
 
 from idaes.core.util.model_statistics import large_residuals_set, variables_near_bounds_set
+import idaes.core.util.scaling as iscale
+from pyomo.opt import SolverStatus, TerminationCondition
 
 import matplotlib.pyplot as plt
 
@@ -59,11 +62,9 @@ class DegeneracyHunter():
             # setup pynumero interface
             self.nlp = PyomoNLP(self.block)
 
-            # calculate Jacobian of equality constraints in COO sparse matrix format
-            jac_eq = self.nlp.evaluate_jacobian_eq()
-
-            # save the Jacobian
-            self.jac_eq = jac_eq
+            # Get the scaled Jacobian of equality constraints
+            self.jac_eq = iscale.get_jacobian(self.block,
+                                              equality_constraints_only=True)[0]
         
             # Create a list of equality constraint names            
             self.eq_con_list = PyomoNLP.get_pyomo_equality_constraints(self.nlp)
@@ -110,7 +111,7 @@ class DegeneracyHunter():
         self.min_nonzero_nu = 1E-5
         
         
-    def check_residuals(self, tol=1e-5, print_level=2, sort=True):
+    def check_residuals(self, tol=1e-5, print_level=1, sort=True):
         """
         Method to return a ComponentSet of all Constraint components with a
         residual greater than a given threshold which appear in a model.
@@ -196,7 +197,7 @@ class DegeneracyHunter():
             
         return vnbs
     
-    def check_rank_equality_constraints(self, tol=1E-6):
+    def check_rank_equality_constraints(self, tol=1E-6, dense=False):
         """
         Method to check the rank of the Jacobian of the equality constraints
         
@@ -216,7 +217,7 @@ class DegeneracyHunter():
         counter = 0
         if self.n_eq > 1:
             if self.s is None:
-                self.svd_analysis()
+                self.svd_analysis(dense=dense)
 
             n = len(self.s)
         
@@ -489,7 +490,7 @@ class DegeneracyHunter():
             return None, None
         
     
-    def svd_analysis(self, n_smallest_sv=10):
+    def svd_analysis(self, n_smallest_sv=10, dense=False):
         '''
         Perform SVD analysis of the constraint Jacobian
         
@@ -505,11 +506,12 @@ class DegeneracyHunter():
         '''
         
         if self.n_eq > 1:
-        
+            
             # Determine the number of singular values to compute
             # The "-1" is needed to avoid an error with svds
-            n_sv = min(n_smallest_sv, min(self.n_eq, self.n_var) - 1)
-            print("Computing the",n_sv,"smallest singular value(s)")
+            if not dense:
+                n_sv = min(n_smallest_sv, min(self.n_eq, self.n_var) - 1)
+                print("Computing the",n_sv,"smallest singular value(s)")
         
             # Perform SVD
             # Recall J is a n_eq x n_var matrix
@@ -517,8 +519,16 @@ class DegeneracyHunter():
             # And V is a n_var x n_var
             # (U or V may be smaller in economy mode)
             # Thus we really only care about U
-            u, s, v = svds(self.jac_eq, k = n_sv, which='SM')
-        
+            
+            if dense:
+                u, s, vT = svd(self.jac_eq.todense())
+                u = u[:,-1-n_smallest_sv:]
+                s = s[-1-n_smallest_sv:]
+                vT = vT[-1-n_smallest_sv:,:]
+                v = vT.transpose()
+            else:
+                u, s, v = svds(self.jac_eq, k = n_sv, which='SM')#, solver='lobpcg')
+            
             # Save results
             self.u = u
             self.s = s

@@ -242,8 +242,18 @@ def test_problem2_with_degenerate_constraint():
     assert pytest.approx(x_sln[2], abs=1E-6) == 0.0
     
     # Check the rank
-    n_rank_deficient = dh2.check_rank_equality_constraints()
-    
+    n_rank_deficient = dh2.check_rank_equality_constraints(dense=True)
+    assert dh2.jac_eq.shape == (2,3)
+    assert dh2.u.shape == (2,2)
+    assert dh2.v.shape == (3,3)
+    assert dh2.s.shape == (2,)
     assert n_rank_deficient == 1
     
+    # Test DH with SVD
+    # Is there any way to test whether the sparse SVD is actually used?
+    # Trying to do an SVD of a 50000x50000 identity matrix would work, but
+    # would produce an extremely slow test failure
+    dh3 = DegeneracyHunter(m2)
+    n_rank_deficient = dh3.check_rank_equality_constraints(dense=False)
+    assert n_rank_deficient == 1
     # TODO: Add MILP solver to idaes get-extensions and add more tests

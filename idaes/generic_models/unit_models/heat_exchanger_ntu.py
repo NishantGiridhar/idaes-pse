@@ -29,7 +29,6 @@ from pyomo.environ import (Block,
                            units as pyunits,
                            Var)
 from pyomo.common.config import Bool, ConfigBlock, ConfigValue, In
-from pyomo.common.deprecation import deprecated
 
 # Import IDAES cores
 from idaes.core import (ControlVolume0DBlock,
@@ -302,7 +301,7 @@ constructed,
 
     # TODO : Add scaling methods
 
-    def initialize_build(
+    def initialize(
         self,
         hot_side_state_args=None,
         cold_side_state_args=None,
@@ -360,6 +359,10 @@ constructed,
 
         # ---------------------------------------------------------------------
         # Solve unit without heat transfer equation
+        # if costing block exists, deactivate
+        if hasattr(self, "costing"):
+            self.costing.deactivate()
+
         self.energy_balance_constraint.deactivate()
 
         # Get side 1 and side 2 heat units, and convert duty as needed
@@ -416,6 +419,11 @@ constructed,
         init_log.info("Initialization Completed, {}".format(
             idaeslog.condition(res)))
 
+        # if costing block exists, activate and initialize
+        if hasattr(self, "costing"):
+            self.costing.activate()
+            costing.initialize(self.costing)
+
         if not check_optimal_termination(res):
             raise InitializationError(
                 f"{self.name} failed to initialize successfully. Please check "
@@ -432,11 +440,6 @@ constructed,
             time_point=time_point,
         )
 
-    @deprecated(
-        "The get_costing method is being deprecated in favor of the new "
-        "FlowsheetCostingBlock tools.",
-        version="TBD",
-    )
     def get_costing(self, module=costing, year=None, **kwargs):
         if not hasattr(self.flowsheet(), "costing"):
             self.flowsheet().get_costing(year=year)

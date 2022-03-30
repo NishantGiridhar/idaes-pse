@@ -2,9 +2,9 @@ Downcomer Model
 ===============
 
 .. index::
-  pair: idaes.models_extra.power_generation.unit_models.downcomer;Downcomer
+  pair: idaes.power_generation.unit_models.downcomer;Downcomer
 
-.. currentmodule:: idaes.models_extra.power_generation.unit_models.downcomer
+.. currentmodule:: idaes.power_generation.unit_models.downcomer
 
 Introduction
 ------------

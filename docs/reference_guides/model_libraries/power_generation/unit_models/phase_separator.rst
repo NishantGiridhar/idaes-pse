@@ -2,10 +2,10 @@ HelmPhaseSeparator Model
 ========================
 
 .. index::
-  pair: idaes.models_extra.power_generation.unit_models.helm.phase_separator;HelmPhaseSeparator
+  pair: idaes.power_generation.unit_models.helm.phase_separator;HelmPhaseSeparator
 
 
-.. currentmodule:: idaes.models_extra.power_generation.unit_models.helm.phase_separator
+.. currentmodule:: idaes.power_generation.unit_models.helm.phase_separator
 
 Introduction
 ------------

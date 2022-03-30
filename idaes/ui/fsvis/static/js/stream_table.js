@@ -178,18 +178,16 @@ export class StreamTable {
             // When the mouse hovers over a grid cell, the link as well as the
             // stream column that represents the correct stream will be highlighted.
             gridCell.addEventListener('mouseenter', function(event) {
-                if (document.querySelector("#view-stream-highlight-btn").checked) {
-                    const highlightStreamEvent = new CustomEvent(
-                        'HighlightStream',
-                        {
-                            detail: {
-                                streamId: event.target.attributes['col-id'].value
-                            }
+                const highlightStreamEvent = new CustomEvent(
+                    'HighlightStream',
+                    {
+                        detail: {
+                            streamId: event.target.attributes['col-id'].value
                         }
-                    );
-                    streamTable.dispatchEvent(highlightStreamEvent);
-                    idaesCanvas.dispatchEvent(highlightStreamEvent);
-                }
+                    }
+                );
+                streamTable.dispatchEvent(highlightStreamEvent);
+                idaesCanvas.dispatchEvent(highlightStreamEvent);
             });
 
             // When the mouse leaves a grid cell, the link as well as the

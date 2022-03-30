@@ -128,7 +128,7 @@ see property package for documentation.}""",
         # Add outlet port
         self.add_port(name="inlet", block=self.properties, doc="Inlet Port")
 
-    def initialize_build(
+    def initialize(
         blk, state_args=None, outlvl=idaeslog.NOTSET,
         solver=None, optarg=None
     ):

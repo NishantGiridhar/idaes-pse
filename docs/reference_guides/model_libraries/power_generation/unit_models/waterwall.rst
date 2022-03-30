@@ -2,9 +2,9 @@ WaterWall Model
 ===============
 
 .. index::
-  pair: idaes.models_extra.power_generation.unit_models.waterwall;WaterwallSection
+  pair: idaes.power_generation.unit_models.waterwall;WaterwallSection
 
-.. currentmodule:: idaes.models_extra.power_generation.unit_models.waterwall
+.. currentmodule:: idaes.power_generation.unit_models.waterwall
 
 Introduction
 ------------

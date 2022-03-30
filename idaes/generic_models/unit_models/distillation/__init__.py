@@ -17,19 +17,19 @@ from pyomo.common.deprecation import relocated_module_attribute
 
 relocated_module_attribute(
     'Condenser',
-    'idaes.models_extra.column_models.condenser.Condenser',
-    version='2.0.0.alpha0')
+    'idaes.generic_models.unit_models.column_models.condenser.Condenser',
+    version='1.12')
 relocated_module_attribute(
     'Reboiler',
-    'idaes.models_extra.column_models.reboiler.Reboiler',
-    version='2.0.0.alpha0')
+    'idaes.generic_models.unit_models.column_models.reboiler.Reboiler',
+    version='1.12')
 relocated_module_attribute(
     'Tray',
-    'idaes.models_extra.column_models.tray.Tray',
-    version='2.0.0.alpha0')
+    'idaes.generic_models.unit_models.column_models.tray.Tray',
+    version='1.12')
 relocated_module_attribute(
     'TrayColumn',
-    'idaes.models_extra.column_models.tray_column.TrayColumn',
-    version='2.0.0.alpha0')
+    'idaes.generic_models.unit_models.column_models.tray_column.TrayColumn',
+    version='1.12')
 
 del relocated_module_attribute

@@ -2,9 +2,9 @@ Steam Heater Model
 ==================
 
 .. index::
-  pair: idaes.models_extra.power_generation.unit_models.steamheater;SteamHeater
+  pair: idaes.power_generation.unit_models.steamheater;SteamHeater
 
-.. currentmodule:: idaes.models_extra.power_generation.unit_models.steamheater
+.. currentmodule:: idaes.power_generation.unit_models.steamheater
 
 Introduction
 ------------
