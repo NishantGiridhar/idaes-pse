@@ -12,35 +12,23 @@
 ##############################################################################
 
 import copy
-import numpy as np
-from scipy.interpolate import griddata
-from itertools import combinations
 import enum
-import sys
 
 from pyomo.common.config import ConfigBlock, ConfigValue, In
-from pyomo.dae import ContinuousSet, DerivativeVar
+from pyomo.dae import DerivativeVar
 import pyomo.environ as pyo
-from pyomo.common import Executable
 from pyomo.network import Port
-from pyomo.dae.flatten import flatten_dae_components
 
 
-from idaes.core.util.config import is_physical_parameter_block
 from idaes.core import declare_process_block_class, UnitModelBlockData, useDefault
-from idaes.generic_models.properties.core.generic.generic_property import (
-    GenericParameterBlock,
-)
+# from idaes.models.unit_models.heat_exchanger import HeatExchangerFlowPattern
 import idaes.core.util.scaling as iscale
-from idaes.core.solvers import use_idaes_solver_configuration_defaults
-import idaes
-from idaes.core.util.math import safe_log, smooth_max, safe_sqrt
+from idaes.core.util.exceptions import ConfigurationError, InitializationError
+from idaes.core.util.math import safe_log
 from idaes.core.util import get_solver
-import idaes.core.util.model_serializer as ms
 import idaes.core.util.model_statistics as mstat
 
-from idaes.core.util.misc import add_object_reference, VarLikeExpression
-from idaes.core.solvers import petsc
+from idaes.core.util.misc import VarLikeExpression
 import idaes.logger as idaeslog
 
 
@@ -89,15 +77,43 @@ def _set_if_unfixed(v, val):
 def _create_if_none(blk, var, idx_set, units):
     attr = getattr(blk.config,var)
     if attr is None:
-        setattr(blk, var, 
-                pyo.Var(
-                    *idx_set,
-                    initialize=0, 
-                    units=units,
-                    )
-        )
+        if idx_set is None:
+            setattr(blk, var, 
+                    pyo.Var(
+                        initialize=0, 
+                        units=units,
+                        )
+            )
+        else:
+            setattr(blk, var, 
+                    pyo.Var(
+                        *idx_set,
+                        initialize=0, 
+                        units=units,
+                        )
+            )
     else:
         setattr(blk, var, pyo.Reference(attr))
+
+def _init_dof_error(blk):
+    if not mstat.degrees_of_freedom(blk) == 0:
+        raise InitializationError(
+            f"{blk.name} encountered a nonsquare optimization problem during "
+            "initialization. Check whether all parameter values are fixed and "
+            "keep in mind that the SOC submodel initialization methods assume "
+            "that certain degrees of freedom have been fixed by the cell "
+            "initialization method."
+        )       
+
+def _init_solve_block(blk, solver, log):
+    _init_dof_error(blk)
+    with idaeslog.solver_log(log, idaeslog.DEBUG) as slc:
+        results = solver.solve(blk, tee=slc.tee)
+    if not pyo.check_optimal_termination(results):
+        raise InitializationError(
+            f"{blk.name} failed to initialize successfully. Please check "
+            f"the output logs for more information."
+        )
 
 def _interpolate_channel(
     iz, ifaces, nodes, faces, phi_func, phi_inlet, method, opposite_flow
@@ -584,338 +600,6 @@ def comp_entropy_expr(temperature, comp):
         / pyo.units.K
     )
 
-def _make_degradation_expressions(m,dynamic):
-    # before solving model, try to integrate with the health model for anode/electrolyte/cathode layer
-    # equations was obtained in R.Clague et al., J. Power Sources, vol. 210, 2012
-    reference_temperature = 1283 # K
-
-    # parameter for thermal stress calculations
-    feE = m.fs.fuel_electrode.young_modulus = pyo.Var()
-    fecte = m.fs.fuel_electrode.cte = pyo.Var()
-    fepc = m.fs.fuel_electrode.poisson_coefficient = pyo.Var()
-    eE = m.fs.electrolyte.young_modulus = pyo.Var()
-    ecte = m.fs.electrolyte.cte = pyo.Var()
-    epc = m.fs.electrolyte.poisson_coefficient = pyo.Var()
-    oeE = m.fs.oxygen_electrode.young_modulus = pyo.Var()
-    oecte = m.fs.oxygen_electrode.cte = pyo.Var()
-    oepc = m.fs.oxygen_electrode.poisson_coefficient = pyo.Var()
-
-
-    @m.fs.Expression(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes, doc='temperature change in fuel electrode')
-    def fuel_electrode_temperature_change(b, t, ixf, iz):
-        for ix in b.fuel_electrode.ixnodes:
-            if ixf == b.fuel_electrode.xfaces.first():
-                return b.fuel_electrode.temperature_x0[t, iz] - reference_temperature
-            elif ixf == b.fuel_electrode.xfaces.last():
-                return b.fuel_electrode.temperature_x1[t, iz] - reference_temperature
-            return b.fuel_electrode.temperature[t, ix, iz] - reference_temperature
-
-    @m.fs.Expression(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes, doc='temperature change in electrolyte')
-    def electrolyte_temperature_change(b, t, ixf, iz):
-        for ix in b.electrolyte.ixnodes:
-            if ixf == b.electrolyte.xfaces.first():
-                return b.electrolyte.temperature_x0[t, iz] - reference_temperature
-            elif ixf == b.electrolyte.xfaces.last():
-                return b.electrolyte.temperature_x1[t, iz] - reference_temperature
-            return b.electrolyte.temperature[t, ix, iz] - reference_temperature
-
-    @m.fs.Expression(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes, doc='temperature change in oxygen electrode')
-    def oxygen_electrode_temperature_change(b, t, ixf, iz):
-        for ix in b.oxygen_electrode.ixnodes:
-            if ixf == b.oxygen_electrode.xfaces.first():
-                return b.oxygen_electrode.temperature_x0[t, iz] - reference_temperature
-            elif ixf == b.oxygen_electrode.xfaces.last():
-                return b.oxygen_electrode.temperature_x1[t, iz] - reference_temperature
-            return b.oxygen_electrode.temperature[t, ix, iz] - reference_temperature
-
-    
-    # parameters for thermal stress model
-    @m.fs.Expression(doc='position of bending axis')
-    def tb(b):
-        return (-feE/(1-fepc)*b.fuel_electrode.length_x**2 + oeE/(1-oepc
-            )*(2*b.oxygen_electrode.length_x*b.electrolyte.length_x + b.oxygen_electrode.length_x**2) + eE/(1-epc)*b.electrolyte.length_x**2) / (2*(
-            feE/(1-fepc)*b.fuel_electrode.length_x + eE/(1-epc)*b.electrolyte.length_x + oeE/(1-oepc)*b.oxygen_electrode.length_x))
-
-
-    @m.fs.Expression(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes, doc='uniform strain component in fuel electrode')
-    def fuel_electrode_uniform_strain_component(b, t, ixf, iz):
-        for ix in b.fuel_electrode.ixnodes:
-            if ixf == b.fuel_electrode.xfaces.first():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.first(), iz]
-            elif ixf == b.fuel_electrode.xfaces.last():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.fuel_electrode_temperature_change[t, ix, iz]
-            return fecte * deltaT + (((
-                                ecte - fecte)  * eE/(
-                                1-epc) * b.electrolyte.length_x) + ((
-                                                    oecte - fecte)  * oeE/(
-                                                    1-oepc) * b.oxygen_electrode.length_x)) * deltaT /(
-                    feE/(1-fepc)*b.fuel_electrode.length_x + eE/(1-epc)*b.electrolyte.length_x + oeE/(1-oepc)*b.oxygen_electrode.length_x)
-
-
-    @m.fs.Expression(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes, doc='radius of curvature of fuel electrode')
-    def fuel_electrode_reverse_curvature_radius(b, t, ixf, iz):
-        for ix in b.fuel_electrode.ixnodes:
-            if ixf == b.fuel_electrode.xfaces.first():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.first(), iz]
-            elif ixf == b.fuel_electrode.xfaces.last():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.fuel_electrode_temperature_change[t, ix, iz]
-            return 6*deltaT*(feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc)*b.electrolyte.length_x*(b.fuel_electrode.length_x+b.electrolyte.length_x
-                )*(ecte-fecte) + feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                b.fuel_electrode.length_x + 2*b.electrolyte.length_x + b.oxygen_electrode.length_x)*(oecte-fecte)+eE/(
-                1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(2*b.electrolyte.length_x+b.oxygen_electrode.length_x
-                )*(oecte-ecte)) / ((feE/(1-fepc))**2*(b.fuel_electrode.length_x)**4+(eE/(1-epc))**2*(b.electrolyte.length_x)**4+(
-                oeE/(1-oepc))**2*(b.oxygen_electrode.length_x)**4+2*feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc
-                )*b.electrolyte.length_x*(2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.electrolyte.length_x+2*b.electrolyte.length_x**2
-                )+2*eE/(1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.electrolyte.length_x**2+3*b.electrolyte.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(6*b.electrolyte.length_x*(
-                    b.fuel_electrode.length_x+b.electrolyte.length_x+b.oxygen_electrode.length_x)))
-
-    @m.fs.Expression(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes, doc='total strain in fuel electrode')
-    def fuel_electrode_total_strain(b, t, ixf, iz):
-        return (b.fuel_electrode_uniform_strain_component[t, ixf, iz] + (-b.fuel_electrode.xfaces.at(-ixf)*b.fuel_electrode.length_x - b.tb
-                    ) * b.fuel_electrode_reverse_curvature_radius[t, ixf, iz])
-
-    @m.fs.Expression(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes, doc='residual thermal stress in fuel electrode')
-    def fuel_electrode_residual_thermal_stress(b, t, ixf, iz):
-        for ix in b.fuel_electrode.ixnodes:
-            if ixf == b.fuel_electrode.xfaces.first():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.first(), iz]
-            elif ixf == b.fuel_electrode.xfaces.last():
-                deltaT = b.fuel_electrode_temperature_change[t, b.fuel_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.fuel_electrode_temperature_change[t, ix, iz]
-            return feE/(1-fepc) * (b.fuel_electrode_total_strain[t, ixf, iz] - fecte * deltaT)
-
-
-    # parameters for electrolyte
-    @m.fs.Expression(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes, doc='uniform strain component in electrolyte')
-    def electrolyte_uniform_strain_component(b, t, ixf, iz):
-        for ix in b.electrolyte.ixnodes:
-            if ixf == b.electrolyte.xfaces.first():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.first(), iz]
-            elif ixf == b.electrolyte.xfaces.last():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.last(), iz]
-            else:
-                deltaT = b.electrolyte_temperature_change[t, ix, iz]
-            return fecte * deltaT + (((
-                                ecte - fecte)  * eE/(
-                                1-epc) * b.electrolyte.length_x) + ((
-                                                    oecte - fecte)  * oeE/(
-                                                    1-oepc) * b.oxygen_electrode.length_x)) * deltaT /(
-                    feE/(1-fepc)*b.fuel_electrode.length_x + eE/(1-epc)*b.electrolyte.length_x + oeE/(1-oepc)*b.oxygen_electrode.length_x)
-
-
-    @m.fs.Expression(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes, doc='radius of curvature of electrolyte')
-    def electrolyte_reverse_curvature_radius(b, t, ixf, iz):
-        for ix in b.electrolyte.ixnodes:
-            if ixf == b.electrolyte.xfaces.first():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.first(), iz]
-            elif ixf == b.electrolyte.xfaces.last():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.last(), iz]
-            else:
-                deltaT = b.electrolyte_temperature_change[t, ix, iz]
-            return 6*deltaT*(feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc)*b.electrolyte.length_x*(b.fuel_electrode.length_x+b.electrolyte.length_x
-                )*(ecte-fecte) + feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                b.fuel_electrode.length_x + 2*b.electrolyte.length_x + b.oxygen_electrode.length_x)*(oecte-fecte)+eE/(
-                1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(2*b.electrolyte.length_x+b.oxygen_electrode.length_x
-                )*(oecte-ecte)) / ((feE/(1-fepc))**2*(b.fuel_electrode.length_x)**4+(eE/(1-epc))**2*(b.electrolyte.length_x)**4+(
-                oeE/(1-oepc))**2*(b.oxygen_electrode.length_x)**4+2*feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc
-                )*b.electrolyte.length_x*(2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.electrolyte.length_x+2*b.electrolyte.length_x**2
-                )+2*eE/(1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.electrolyte.length_x**2+3*b.electrolyte.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(6*b.electrolyte.length_x*(
-                    b.fuel_electrode.length_x+b.electrolyte.length_x+b.oxygen_electrode.length_x)))
-
-    @m.fs.Expression(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes, doc='total strain in electrolyte')
-    def electrolyte_total_strain(b, t, ixf, iz):
-        return b.electrolyte_uniform_strain_component[t, ixf, iz] + (b.electrolyte.xfaces.at(ixf)*b.electrolyte.length_x - b.tb
-                ) * b.electrolyte_reverse_curvature_radius[t, ixf, iz]
-
-    @m.fs.Expression(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes, doc='residual thermal stress in electrolyte')
-    def electrolyte_residual_thermal_stress(b, t, ixf, iz):
-        for ix in b.electrolyte.ixnodes:
-            if ixf == b.electrolyte.xfaces.first():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.first(), iz]
-            elif ixf == b.electrolyte.xfaces.last():
-                deltaT = b.electrolyte_temperature_change[t, b.electrolyte.ixfaces.last(), iz]
-            else:
-                deltaT = b.electrolyte_temperature_change[t, ix, iz]
-            return eE/(1-epc) * (b.electrolyte_total_strain[t, ixf, iz] - ecte * deltaT)
-
-
-    @m.fs.Expression(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes, doc='uniform strain component in oxygen electrode')
-    def oxygen_electrode_uniform_strain_component(b, t, ixf, iz):
-        for ix in b.oxygen_electrode.ixnodes:
-            if ixf == b.oxygen_electrode.xfaces.first():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.first(), iz]
-            elif ixf == b.oxygen_electrode.xfaces.last():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.oxygen_electrode_temperature_change[t, ix, iz]
-            return fecte * deltaT + (((
-                                ecte - fecte)  * eE/(
-                                1-epc) * b.electrolyte.length_x) + ((
-                                                    oecte - fecte)  * oeE/(
-                                                    1-oepc) * b.oxygen_electrode.length_x)) * deltaT /(
-                    feE/(1-fepc)*b.fuel_electrode.length_x + eE/(1-epc)*b.electrolyte.length_x + oeE/(1-oepc)*b.oxygen_electrode.length_x)
-
-    @m.fs.Expression(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes, doc='radius of curvature in oxygen electrode')
-    def oxygen_electrode_reverse_curvature_radius(b, t, ixf, iz):
-        for ix in b.oxygen_electrode.ixnodes:
-            if ixf == b.oxygen_electrode.xfaces.first():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.first(), iz]
-            elif ixf == b.oxygen_electrode.xfaces.last():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.oxygen_electrode_temperature_change[t, ix, iz]
-            return 6*deltaT*(feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc)*b.electrolyte.length_x*(b.fuel_electrode.length_x+b.electrolyte.length_x
-                )*(ecte-fecte) + feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                b.fuel_electrode.length_x + 2*b.electrolyte.length_x + b.oxygen_electrode.length_x)*(oecte-fecte)+eE/(
-                1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(2*b.electrolyte.length_x+b.oxygen_electrode.length_x
-                )*(oecte-ecte)) / ((feE/(1-fepc))**2*(b.fuel_electrode.length_x)**4+(eE/(1-epc))**2*(b.electrolyte.length_x)**4+(
-                oeE/(1-oepc))**2*(b.oxygen_electrode.length_x)**4+2*feE/(1-fepc)*b.fuel_electrode.length_x*eE/(1-epc
-                )*b.electrolyte.length_x*(2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.electrolyte.length_x+2*b.electrolyte.length_x**2
-                )+2*eE/(1-epc)*b.electrolyte.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.electrolyte.length_x**2+3*b.electrolyte.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(
-                2*b.fuel_electrode.length_x**2+3*b.fuel_electrode.length_x*b.oxygen_electrode.length_x+2*b.oxygen_electrode.length_x**2
-                )+2*feE/(1-fepc)*b.fuel_electrode.length_x*oeE/(1-oepc)*b.oxygen_electrode.length_x*(6*b.electrolyte.length_x*(
-                    b.fuel_electrode.length_x+b.electrolyte.length_x+b.oxygen_electrode.length_x)))
-
-    @m.fs.Expression(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes, doc='total strain in oxygen electrode')
-    def oxygen_electrode_total_strain(b, t, ixf, iz):
-        return b.oxygen_electrode_uniform_strain_component[t, ixf, iz] + (((b.oxygen_electrode.xfaces.at(ixf)*b.oxygen_electrode.length_x
-                )+b.electrolyte.length_x) - b.tb) * b.oxygen_electrode_reverse_curvature_radius[t, ixf, iz]
-
-    @m.fs.Expression(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes, doc='residual thermal stress in oxygen electrode')
-    def oxygen_electrode_residual_thermal_stress(b, t, ixf, iz):
-        for ix in b.oxygen_electrode.ixnodes:
-            if ixf == b.oxygen_electrode.xfaces.first():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.first(), iz]
-            elif ixf == b.oxygen_electrode.xfaces.last():
-                deltaT = b.oxygen_electrode_temperature_change[t, b.oxygen_electrode.ixfaces.last(), iz]
-            else:
-                deltaT = b.oxygen_electrode_temperature_change[t, ix, iz]
-        return oeE/(1-oepc) * (b.oxygen_electrode_total_strain[t, ix, iz] - oecte * deltaT)
-
-    # writing additional variables and constraint to integrate thermal stress model using Petsc solver
-    fe_temperature_change = m.fs.fe_temperature_change = pyo.Var(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    e_temperature_change = m.fs.e_temperature_change = pyo.Var(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    oe_temperature_change = m.fs.oe_temperature_change = pyo.Var(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    # tb = m.fs.tb_x = pyo.Var()
-    fe_uniform_strain_component = m.fs.fe_uniform_strain_component = pyo.Var(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    fe_reverse_curvature_radius = m.fs.fe_reverse_curvature_radius = pyo.Var(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    fe_total_strain = m.fs.fe_total_strain = pyo.Var(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    fe_residual_thermal_stress = m.fs.fe_residual_thermal_stress = pyo.Var(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    e_uniform_strain_component = m.fs.e_uniform_strain_component = pyo.Var(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    e_reverse_curvature_radius = m.fs.e_reverse_curvature_radius = pyo.Var(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    e_total_strain = m.fs.e_total_strain = pyo.Var(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    e_residual_thermal_stress = m.fs.e_residual_thermal_stress = pyo.Var(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    oe_uniform_strain_component = m.fs.oe_uniform_strain_component = pyo.Var(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    oe_reverse_curvature_radius = m.fs.oe_reverse_curvature_radius = pyo.Var(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    oe_total_strain = m.fs.oe_total_strain = pyo.Var(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    oe_residual_thermal_stress =  m.fs.oe_residual_thermal_stress = pyo.Var(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-
-    @m.fs.Constraint(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    def fe_temperature_change_eqn(b, t, ixf, iz):
-        return b.fe_temperature_change[t, ixf, iz] == b.fuel_electrode_temperature_change[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    def e_temperature_change_eqn(b, t, ixf, iz):
-        return b.e_temperature_change[t, ixf, iz] == b.electrolyte_temperature_change[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    def oe_temperature_change_eqn(b, t, ixf, iz):
-        return b.oe_temperature_change[t, ixf, iz] == b.oxygen_electrode_temperature_change[t, ixf, iz]
-
-    # @m.fs.Constraint()
-    # def tb_x_eqn(b):
-    #     return b.tb_x == b.tb
-
-    @m.fs.Constraint(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    def fe_uniform_strain_component_eqn(b, t, ixf, iz):
-        return b.fe_uniform_strain_component[t, ixf, iz] == b.fuel_electrode_uniform_strain_component[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    def fe_reverse_curvature_radius_eqn(b, t, ixf, iz):
-        return b.fe_reverse_curvature_radius[t, ixf, iz] == b.fuel_electrode_reverse_curvature_radius[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    def fe_total_strain_eqn(b, t, ixf, iz):
-        return b.fe_total_strain[t, ixf, iz] == b.fuel_electrode_total_strain[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.fuel_electrode.ixfaces, m.fs.fuel_electrode.iznodes)
-    def fe_residual_thermal_stress_eqn(b, t, ixf, iz):
-        return b.fe_residual_thermal_stress[t, ixf, iz] == b.fuel_electrode_residual_thermal_stress[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    def e_uniform_strain_component_eqn(b, t, ixf, iz):
-        return b.e_uniform_strain_component[t, ixf, iz] == b.electrolyte_uniform_strain_component[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    def e_reverse_curvature_radius_eqn(b, t, ixf, iz):
-        return b.e_reverse_curvature_radius[t, ixf, iz] == b.electrolyte_reverse_curvature_radius[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    def e_total_strain_eqn(b, t, ixf, iz):
-        return b.e_total_strain[t, ixf, iz] == b.electrolyte_total_strain[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.electrolyte.ixfaces, m.fs.electrolyte.iznodes)
-    def e_residual_thermal_stress_eqn(b, t, ixf, iz):
-        return b.e_residual_thermal_stress[t, ixf, iz] == b.electrolyte_residual_thermal_stress[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    def oe_uniform_strain_component_eqn(b, t, ixf, iz):
-        return b.oe_uniform_strain_component[t, ixf, iz] == b.oxygen_electrode_uniform_strain_component[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    def oe_reverse_curvature_radius_eqn(b, t, ixf, iz):
-        return b.oe_reverse_curvature_radius[t, ixf, iz] == b.oxygen_electrode_reverse_curvature_radius[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    def oe_total_strain_eqn(b, t, ixf, iz):
-        return b.oe_total_strain[t, ixf, iz] == b.oxygen_electrode_total_strain[t, ixf, iz]
-
-    @m.fs.Constraint(m.fs.time, m.fs.oxygen_electrode.ixfaces, m.fs.oxygen_electrode.iznodes)
-    def oe_residual_thermal_stress_eqn(b, t, ixf, iz):
-        return b.oe_residual_thermal_stress[t, ixf, iz] == b.oxygen_electrode_residual_thermal_stress[t, ixf, iz]
-
-    if dynamic:
-        t0 = m.fs.time.first()
-        # m.fs.tb_x_eqn.deactivate()
-        degredation_constraints = [m.fs.fe_temperature_change_eqn,
-                                   m.fs.e_temperature_change_eqn,
-                                   m.fs.oe_temperature_change_eqn,
-                                   m.fs.fe_uniform_strain_component_eqn,
-                                   m.fs.e_reverse_curvature_radius_eqn,
-                                   m.fs.e_total_strain_eqn,
-                                   m.fs.e_residual_thermal_stress_eqn,
-                                   m.fs.oe_uniform_strain_component_eqn,
-                                   m.fs.oe_reverse_curvature_radius_eqn,
-                                   m.fs.oe_total_strain_eqn,
-                                   m.fs.oe_residual_thermal_stress_eqn]
-        for con in degredation_constraints:
-            con[t0,:,:].deactivate()
-    # fixed variables from thermal stress model
-    m.fs.fuel_electrode.young_modulus.fix(207.2e3)
-    m.fs.fuel_electrode.cte.fix(11.7e-6)
-    m.fs.fuel_electrode.poisson_coefficient.fix(0.328)
-    m.fs.electrolyte.young_modulus.fix(190e3)
-    m.fs.electrolyte.cte.fix(7.6e-6)
-    m.fs.electrolyte.poisson_coefficient.fix(0.308)
-    m.fs.oxygen_electrode.young_modulus.fix(110e3)
-    m.fs.oxygen_electrode.cte.fix(9.8e-6)
-    m.fs.oxygen_electrode.poisson_coefficient.fix(0.36)
-
 def _submodel_boilerplate_config(CONFIG):
     CONFIG.declare(
         "cv_zfaces",
@@ -948,11 +632,11 @@ def _submodel_boilerplate_create_if_none(unit):
     iznodes = unit.iznodes
     _create_if_none(unit,
                     "length_z",
-                    idx_set=(None),
+                    idx_set=None,
                     units=pyo.units.m)
     _create_if_none(unit,
                     "length_y",
-                    idx_set=(None),
+                    idx_set=None,
                     units=pyo.units.m)
     _create_if_none(unit,
                     "current_density",
@@ -1163,7 +847,7 @@ class SocChannelData(UnitModelBlockData):
         ConfigValue(default=False, description="If True assume velocity is negative"),
     )
     CONFIG.declare(
-        "above_electrode",
+        "below_electrode",
         ConfigValue(domain=In([True, False]),
                     description="Decides whether or not to create material "
                     "flux terms above or below the channel."),
@@ -1180,7 +864,7 @@ class SocChannelData(UnitModelBlockData):
         super().build()
 
         # Set up some sets for the space and time indexing
-        is_dynamic = self.config.dynamic
+        dynamic = self.config.dynamic
         tset = self.flowsheet().config.time
         self.comps = pyo.Set(initialize=self.config.comp_list)
         # z coordinates for nodes and faces
@@ -1205,16 +889,16 @@ class SocChannelData(UnitModelBlockData):
 
         _create_if_none(self,
                         "length_z",
-                        idx_set=(None),
+                        idx_set=None,
                         units=pyo.units.m)
         _create_if_none(self,
                         "length_y",
-                        idx_set=(None),
+                        idx_set=None,
                         units=pyo.units.m)
 
         _create_thermal_boundary_conditions_if_none(self, thin=False)
         
-        if self.config.above_electrode:
+        if not self.config.below_electrode:
             self.Dconc_x0 = pyo.Var(tset, iznodes, comps,
                 doc="Deviation of concentration at electrode surface from that "
                 "in the bulk channel",
@@ -1294,18 +978,19 @@ class SocChannelData(UnitModelBlockData):
             doc="Molar enthalpy at node centers",
             units=pyo.units.J / pyo.units.mol,
         )
-        self.int_energy_mol = pyo.Var(
-            tset,
-            iznodes,
-            doc="Molar internal energy at node centers",
-            units=pyo.units.J / pyo.units.mol,
-        )
-        self.int_energy_density = pyo.Var(
-            tset,
-            iznodes,
-            doc="Molar internal energy density at node centers",
-            units=pyo.units.J / pyo.units.m ** 3,
-        )
+        if self.config.has_holdup:
+            self.int_energy_mol = pyo.Var(
+                tset,
+                iznodes,
+                doc="Molar internal energy at node centers",
+                units=pyo.units.J / pyo.units.mol,
+            )
+            self.int_energy_density = pyo.Var(
+                tset,
+                iznodes,
+                doc="Molar internal energy density at node centers",
+                units=pyo.units.J / pyo.units.m ** 3,
+            )
         self.velocity = pyo.Var(
             tset,
             iznodes,
@@ -1339,7 +1024,7 @@ class SocChannelData(UnitModelBlockData):
         )
 
         # Add time derivative varaible if steady state use const 0.
-        if is_dynamic:
+        if dynamic:
             self.dcdt = DerivativeVar(
                 self.conc,
                 wrt=tset,
@@ -1356,7 +1041,7 @@ class SocChannelData(UnitModelBlockData):
             )
 
         # Add time derivative varaible if steady state use const 0.
-        if is_dynamic:
+        if dynamic:
             self.dcedt = DerivativeVar(
                 self.int_energy_density,
                 wrt=tset,
@@ -1401,7 +1086,8 @@ class SocChannelData(UnitModelBlockData):
         @self.Expression(tset)
         def volume_molar_inlet(b, t):
             return _constR * b.temperature_inlet[t] / b.pressure_inlet[t]
-
+        
+        # TODO maybe replace with variable-constraint pair?
         @self.Expression(tset)
         def enth_mol_inlet(b, t):
             return sum(
@@ -1409,6 +1095,7 @@ class SocChannelData(UnitModelBlockData):
                 * b.mole_frac_comp_inlet[t, i]
                 for i in comps
             )
+        # TODO maybe replace with variable-constraint pair?
         @self.Expression(tset, iznodes, comps)
         def diff_eff_coeff(b, t, iz, i):
             T = b.temperature[t, iz]
@@ -1426,7 +1113,7 @@ class SocChannelData(UnitModelBlockData):
             # this will (hopefully) be enough
             return 2*b.diff_eff_coeff[t, iz, i]/b.length_x
         
-        if self.config.above_electrode:
+        if not self.config.below_electrode:
             @self.Constraint(tset,iznodes,comps)
             def xflux_x0_eqn(b,t,iz,i):
                 return (b.xflux_x0[t,iz,i] 
@@ -1468,22 +1155,21 @@ class SocChannelData(UnitModelBlockData):
                 comp_enthalpy_expr(b.temperature[t, iz], i) * b.mole_frac_comp[t, iz, i]
                 for i in comps
             )
-
-        @self.Constraint(tset, iznodes)
-        def int_energy_mol_eqn(b, t, iz):
-            return b.int_energy_mol[t, iz] == sum(
-                comp_int_energy_expr(b.temperature[t, iz], i)
-                * b.mole_frac_comp[t, iz, i]
-                for i in comps
-            )
-
-        @self.Constraint(tset, iznodes)
-        def int_energy_density_eqn(b, t, iz):
-            return (
-                b.int_energy_density[t, iz]
-                == b.int_energy_mol[t, iz] / b.volume_molar[t, iz]
-            )
-
+        if self.config.has_holdup:
+            @self.Constraint(tset, iznodes)
+            def int_energy_mol_eqn(b, t, iz):
+                return b.int_energy_mol[t, iz] == sum(
+                    comp_int_energy_expr(b.temperature[t, iz], i)
+                    * b.mole_frac_comp[t, iz, i]
+                    for i in comps
+                )
+    
+            @self.Constraint(tset, iznodes)
+            def int_energy_density_eqn(b, t, iz):
+                return (
+                    b.int_energy_density[t, iz]
+                    == b.int_energy_mol[t, iz] / b.volume_molar[t, iz]
+                )
         @self.Constraint(tset, iznodes)
         def mole_frac_eqn(b, t, iz):
             return 1 == sum(b.mole_frac_comp[t, iz, i] for i in comps)
@@ -1555,7 +1241,7 @@ class SocChannelData(UnitModelBlockData):
 
         @self.Constraint(tset, iznodes, comps)
         def material_balance_eqn(b, t, iz, i):
-            # if t == tset.first() and is_dynamic:
+            # if t == tset.first() and dynamic:
             #     return pyo.Constraint.Skip
             return (
                 b.dcdt[t, iz, i] * b.node_volume[iz]
@@ -1563,12 +1249,10 @@ class SocChannelData(UnitModelBlockData):
                 + b.xface_area[iz]
                     * (b.xflux_x0[t, iz, i] - b.xflux_x1[t, iz, i])
             )
-        if is_dynamic:
+        if dynamic:
             self.material_balance_eqn[tset.first(),:,:].deactivate()
         @self.Constraint(tset, iznodes)
         def energy_balance_eqn(b, t, iz):
-            # if t == tset.first() and is_dynamic:
-            #     return pyo.Constraint.Skip
             return (
                 b.dcedt[t, iz] * b.node_volume[iz]
                 == b.flow_area * (b.zflux_enth[t, iz] - b.zflux_enth[t, iz + 1])
@@ -1581,7 +1265,7 @@ class SocChannelData(UnitModelBlockData):
                 + b.qflux_x0[t, iz] * b.xface_area[iz]
                 - b.qflux_x1[t, iz] * b.xface_area[iz]
             )
-        if is_dynamic:
+        if dynamic:
             self.energy_balance_eqn[tset.first(),:].deactivate()
         @self.Constraint(tset, iznodes)
         def temperature_x0_eqn(b, t, iz):
@@ -1644,9 +1328,9 @@ class SocChannelData(UnitModelBlockData):
                 for i in comps
             )
 
-    def initialize(
+    def initialize_build(
         self,
-        outlvl=idaeslog.DEBUG,
+        outlvl=idaeslog.NOTSET,
         solver=None,
         optarg=None,
         xflux_guess=None,
@@ -1657,6 +1341,10 @@ class SocChannelData(UnitModelBlockData):
         # At present, this method does not fix inlet variables because they are
         # fixed at the cell level instead.
         # TODO Add ports to submodel instead?
+        
+        init_log = idaeslog.getInitLogger(self.name, outlvl, tag="unit")
+        solve_log = idaeslog.getSolveLogger(self.name, outlvl, tag="unit")
+    
         tset = self.flowsheet().config.time
         t0 = tset.first()
 
@@ -1692,160 +1380,25 @@ class SocChannelData(UnitModelBlockData):
                         for i in self.config.comp_list
                     ),
                 )
-                _set_if_unfixed(
-                    self.int_energy_mol[t, iz],
-                    sum(
-                        comp_int_energy_expr(self.temperature[t, iz], i)
-                        * self.mole_frac_comp[t, iz, i]
-                        for i in self.config.comp_list
-                    ),
-                )
-                _set_if_unfixed(
-                    self.int_energy_density[t, iz],
-                    self.int_energy_mol[t, iz] / self.volume_molar[t, iz],
-                )
-        assert mstat.degrees_of_freedom(self)==0
-        solver = get_solver(solver, optarg)
-        results = solver.solve(self, tee=True)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
+                if self.config.has_holdup:
+                    _set_if_unfixed(
+                        self.int_energy_mol[t, iz],
+                        sum(
+                            comp_int_energy_expr(self.temperature[t, iz], i)
+                            * self.mole_frac_comp[t, iz, i]
+                            for i in self.config.comp_list
+                        ),
+                    )
+                    _set_if_unfixed(
+                        self.int_energy_density[t, iz],
+                        self.int_energy_mol[t, iz] / self.volume_molar[t, iz],
+                    )
+        slvr = get_solver(solver, optarg)
+        _init_solve_block(self, slvr, solve_log)
 
     def calculate_scaling_factors(self):
-        pass # Use recursive scaling instead
-        # Base default scaling on typical conditions and dimensions
-        # gsf = iscale.get_scaling_factor
-        # ssf = iscale.set_scaling_factor
-        # cst = iscale.constraint_scaling_transform
-        # sdf = _set_default_factor
-        
-        # sp = _scaling_factor_pressure # Pressure
-        # sx = 10 # Mole fraction
-        # #sT = _scaling_factor_temperature_conduction # Temperature
-        # sR = 1  # Gas constant
-        # sD = 1e5 # Diffusion constant
-        
-        # #sC = sx*sp/sR/(sT*1E-1) # Concentration--adjust temp scaling factor
-        # sV = sR*1E-3/sp #sR*(sT*1E-1)/sp # Scaling factor for temperature not reliable
-        
-        # sdf(self.pressure, sp)
-        # sdf(self.pressure_inlet, sp)
-        # #FIXME
-        # ssf(self.pressure_outlet, sp)
-        # sdf(self.temperature_z, _scaling_factor_temperature_thermo)
-        # sdf(self.Dtemp_x0,_scaling_factor_temperature_channel)
-        # sdf(self.Dtemp,_scaling_factor_temperature_channel) #TODO automate
-        # sdf(self.Dtemp_x1,_scaling_factor_temperature_channel)
-        # sdf(self.Dconc_x0,_scaling_factor_concentration)
-        # sdf(self.conc,_scaling_factor_concentration)
-        # sdf(self.Dconc_x1,_scaling_factor_concentration)
-        # sdf(self.volume_molar,sV)
-        
-        # _set_default_factor(self.mole_frac_comp, 10)
-        # _set_default_factor(self.flow_mol, 1e5)
-        # _set_default_factor(self.flow_mol_inlet, 1e5)
-        # #FIXME
-        # ssf(self.flow_mol_outlet, 1e5)
-        # sdf(self.temperature_inlet, _scaling_factor_temperature_thermo)
-        # _set_default_factor(self.velocity, 10)
-        # _set_default_factor(self.xflux_x0, 100)
-        # _set_default_factor(self.xflux_x1, 100)
-        # _set_default_factor(self.int_energy_density, _scaling_factor_energy*1e-1)
-        # _set_default_factor(self.int_energy_mol, _scaling_factor_energy*1e-1)
-        # _set_default_factor(self.enth_mol, _scaling_factor_energy)
-        # #_set_default_factor(self.temperature_x1, sT)
-        # _set_default_factor(self.temperature_inlet, 
-        #                     _scaling_factor_temperature_thermo)
-        # _set_default_factor(self.temperature_outlet, 
-        #                     _scaling_factor_temperature_thermo)
-        # _set_default_factor(self.htc, 1e-1)
+        pass
 
-        # iscale.propagate_indexed_component_scaling_factors(self)
-        # s_length_y = 1 / pyo.value(self.length_y[None])
-        # s_length_z = 1 / pyo.value(self.length_z[None])
-        # s_length_x = 1 / pyo.value(self.length_x[None])
-        # _set_default_factor(self.length_x, s_length_x)
-        # _set_default_factor(self.length_y, s_length_y)
-        # _set_default_factor(self.length_z, s_length_z)
-        # sDz = s_length_z*len(self.iznodes)
-
-        # # estimate conc scaling
-        # for i, var in self.conc.items():
-        #     if iscale.get_scaling_factor(var) is None:
-        #         # sp = iscale.get_scaling_factor(self.pressure[i[0], i[1]])
-        #         # sx = iscale.get_scaling_factor(self.mole_frac_comp[i])
-        #         # st = iscale.get_scaling_factor(self.temperature[i[0], i[1]])
-        #         # sr = 1  # scale for gas constant
-        #         # iscale.set_scaling_factor(self.conc[i], sp * sx / sr / st)
-        #         ssf(var,1)
-        
-        # for i, c in self.constant_pressure_eqn.items():
-        #     sp = gsf(self.pressure[i])
-        #     cst(c,sp)
-        
-        # for i in self.conc_eqn:
-        #     sp = iscale.get_scaling_factor(self.pressure[i[0], i[1]])
-        #     sx = iscale.get_scaling_factor(self.mole_frac_comp[i])
-        #     iscale.constraint_scaling_transform(self.conc_eqn[i], sp * sx)
-
-        # for i, c in self.flow_mol_eqn.items():
-        #     s = iscale.get_scaling_factor(self.flow_mol[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.enth_mol_eqn.items():
-        #     s = iscale.get_scaling_factor(self.enth_mol[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.int_energy_mol_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_mol[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.int_energy_density_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_density[i])
-        #     iscale.constraint_scaling_transform(c, s)
-        
-        # for t, c in self.temperature_outlet_eqn.items():
-        #     # iscale.constraint_scaling_transform(c, 1e-5)
-        #     s = gsf(self.enth_mol[t,self.iznout])
-        #     cst(c,s,overwrite=False)
-
-        # for i, var in  self.qflux_x1.items():
-        #     if iscale.get_scaling_factor(var) is None:
-        #         # sh = iscale.get_scaling_factor(self.htc[i])
-        #         # st = iscale.get_scaling_factor(self.temperature_x1[i])     
-        #         # iscale.set_scaling_factor(var,sh*st)
-        #         ssf(var,1e-2)
-
-        # for i, c in self.temperature_x1_eqn.items():
-        #     s = gsf(self.qflux_x1[i])
-        #     cst(c, s)
-
-        # for i in self.mole_frac_eqn:
-        #     iscale.constraint_scaling_transform(self.mole_frac_eqn[i], 10)
-
-        # # for i,c in self.p_eqn.items():
-        # #     if gsf(c) is None:
-        # #         sP = gsf(self.pressure[i])
-        # #         ssf(c, sP)
-
-        # for (t, iz, j), c in self.material_balance_eqn.items():
-        #     # sLx = iscale.get_scaling_factor(self.length_x)
-        #     # sLy = iscale.get_scaling_factor(self.length_y)
-        #     # sc = iscale.get_scaling_factor(self.conc[t, iz, j])
-        #     # sv = iscale.get_scaling_factor(self.velocity[t, iz])
-        #     # if iscale.get_scaling_factor(c) is None:
-        #     #     iscale.set_scaling_factor(c,sc*sv*sLx*sLy)
-        #     # TODO fix
-        #     cst(c,1e6,overwrite=False)
-                
-        # for (t, iz), c in self.energy_balance_eqn.items():
-        #     sLx = gsf(self.length_x)
-        #     sLy = gsf(self.length_y)
-        #     sh = gsf(self.enth_mol[t, iz])
-        #     sV = gsf(self.volume_molar[t, iz])
-        #     sv = iscale.get_scaling_factor(self.velocity[t, iz])
-        #     #if iscale.get_scaling_factor(c) is None:
-        #     cst(c,sh/sV*sv*sLx*sLy,overwrite=False)
-            
     def model_check(self ,steady_state=True):
         if not steady_state:
             # Mass and energy conservation equations steady state only at present
@@ -1885,9 +1438,10 @@ class SocChannelData(UnitModelBlockData):
                              1e-9) #FIXME justify this number
                 fraction_change = pyo.value((sum_out - sum_in)/normal)
                 if abs(fraction_change) > 1e-5 :
-                    print(f"{element} is not being conserved; fractional "
-                          f"change {fraction_change}")
-                    raise RuntimeError
+                    raise RuntimeError(
+                        f"{element} is not being conserved in {self.name}; "
+                        f"fractional change {fraction_change}."
+                    )
             enth_in = self.enth_mol_inlet[t]*self.flow_mol_inlet[t]
             enth_out = self.enth_mol_outlet[t]*self.flow_mol_outlet[t]
             
@@ -1906,9 +1460,11 @@ class SocChannelData(UnitModelBlockData):
                          1e-4) #FIXME justify this number
             fraction_change = pyo.value((enth_out - enth_in)/normal) 
             if abs(fraction_change) > 3e-3:
-                print("Energy is not being conserved; fractional "
-                      f"change {fraction_change}")
-                raise RuntimeError
+                raise RuntimeError(
+                    f"Energy is not being conserved in {self.name}; "
+                    f"fractional change {fraction_change}"
+                )
+
     def recursive_scaling(self):
         gsf = iscale.get_scaling_factor
         ssf = _set_scaling_factor_if_none
@@ -1930,13 +1486,21 @@ class SocChannelData(UnitModelBlockData):
             sT = sgsf(self.temperature_inlet[t],1e-2)
             ssf(self.temperature_outlet[t],sT)
             sP = sgsf(self.pressure_inlet[t],1e-4)
-            s_flow_mol = sgsf(self.flow_mol_inlet[t],1e5)
-            
+
+            s_flow_mol = sgsf(self.flow_mol_inlet[t],1e3)
             sy_in = {}
             for j in self.comps:
                 sy_in[j] = sgsf(self.mole_frac_comp_inlet[t,j],sy_def)
             
             for iz in self.iznodes:
+                # These should have been scaled by the cell-level method, so
+                # notify the user if they're using a standalone channel
+                # and forgot to scale these
+                if not self.temperature_z[t, iz].is_reference():
+                    gsf(self.temperature_z[t, iz], warning=True)
+                gsf(self.qflux_x0[t,iz], warning=True)
+                gsf(self.qflux_x1[t,iz], warning=True)
+                
                 s_flow_mol = sgsf(self.flow_mol[t,iz],s_flow_mol)
                 sT = sgsf(self.temperature_z[t,iz],sT)
                 sP = sgsf(self.pressure[t,iz],sP)
@@ -1951,11 +1515,12 @@ class SocChannelData(UnitModelBlockData):
                 cst(self.enth_mol_eqn[t,iz],sH)
                 cst(self.energy_balance_eqn[t,iz],sH*s_flow_mol)
                 
-                sU = sgsf(self.int_energy_mol[t,iz],sH)
-                cst(self.int_energy_mol_eqn[t,iz],sU)
-                
-                s_rho_U = sgsf(self.int_energy_density[t,iz],sU/sV)
-                cst(self.int_energy_density_eqn[t,iz],s_rho_U)
+                if self.config.has_holdup:
+                    sU = sgsf(self.int_energy_mol[t,iz],sH)
+                    cst(self.int_energy_mol_eqn[t,iz],sU)
+                    
+                    s_rho_U = sgsf(self.int_energy_density[t,iz],sU/sV)
+                    cst(self.int_energy_density_eqn[t,iz],s_rho_U)
                 
                 sq0 = sgsf(self.qflux_x0[t,iz],1e-2)
                 cst(self.temperature_x0_eqn[t,iz],sq0)
@@ -1972,6 +1537,14 @@ class SocChannelData(UnitModelBlockData):
                 cst(self.mole_frac_eqn[t,iz],1) 
                 
                 for j in self.comps:
+                    # These should have been scaled by the cell-level method, so
+                    # notify the user if they're using a standalone channel
+                    # and forgot to scale these
+                    if self.config.below_electrode:
+                        gsf(self.xflux_x1[t,iz,j], warning=True)
+                    else:
+                        gsf(self.xflux_x0[t,iz,j], warning=True)
+                    
                     sy = sgsf(self.mole_frac_comp[t,iz,j],sy_in[j])
                     cst(self.material_balance_eqn[t,iz,j],s_flow_mol*sy)
                     
@@ -2037,14 +1610,14 @@ class SocElectrodeData(UnitModelBlockData):
         ),
     )
     _submodel_boilerplate_config(CONFIG)
-    _thermal_boundary_conditions_config(CONFIG,thin=False)
-    _material_boundary_conditions_config(CONFIG,thin=False)    
+    _thermal_boundary_conditions_config(CONFIG, thin=False)
+    _material_boundary_conditions_config(CONFIG, thin=False)    
 
     def build(self):
         super().build()
 
         # Set up some sets for the space and time indexing
-        is_dynamic = self.config.dynamic
+        dynamic = self.config.dynamic
         tset = self.flowsheet().config.time
         self.comps = pyo.Set(initialize=self.config.comp_list)
         # z coordinates for nodes and faces
@@ -2079,7 +1652,7 @@ class SocElectrodeData(UnitModelBlockData):
         xfaces = self.xfaces
         xnodes = self.xnodes
         include_temp_x_thermo = self.config.include_temperature_x_thermo
-        
+
         # Electrode thickness AKA length in the x direction is specific to the
         # electrode so local variable here is the only option
         self.length_x = pyo.Var(
@@ -2087,12 +1660,6 @@ class SocElectrodeData(UnitModelBlockData):
             units=pyo.units.m,
         )
 
-        # The concentration along the x=0 boundary comes from the channel, so
-        # optionally make a refernce to that external variable.  Otherwise
-        # just create a new varaible.  Generally the concentration is calculated
-        # at the nodes and interpolated at the faces, so this doesn't overlap
-        # with the conc variable, since this is at the x = 0 face
-        
         if self.config.dynamic:
             # If we're dynamic, the user needs to either provide both the
             # reference concentration and its derivative, or provide neither.
@@ -2122,6 +1689,7 @@ class SocElectrodeData(UnitModelBlockData):
                 self.dconc_refdt = pyo.Param(
                     tset,
                     iznodes,
+                    comps,
                     doc="Derivative of concentration of components in the channel bulk",
                     initialize=0.0,
                     units=pyo.units.mol / (pyo.units.s*pyo.units.m ** 3),
@@ -2170,27 +1738,28 @@ class SocElectrodeData(UnitModelBlockData):
             doc="Molar enthalpy at node centers",
             units=pyo.units.J / pyo.units.mol,
         )
-        self.int_energy_mol = pyo.Var(
-            tset,
-            ixnodes,
-            iznodes,
-            doc="Fluid molar internal energy at node centers",
-            units=pyo.units.J / pyo.units.mol,
-        )
-        self.int_energy_density = pyo.Var(
-            tset,
-            ixnodes,
-            iznodes,
-            doc="Fluid molar internal energy density at node centers",
-            units=pyo.units.J / pyo.units.m ** 3,
-        )
-        self.int_energy_density_solid = pyo.Var(
-            tset,
-            ixnodes,
-            iznodes,
-            doc="Internal energy density of solid electrode",
-            units=pyo.units.J / pyo.units.m ** 3,
-        )
+        if self.config.has_holdup:
+            self.int_energy_mol = pyo.Var(
+                tset,
+                ixnodes,
+                iznodes,
+                doc="Fluid molar internal energy at node centers",
+                units=pyo.units.J / pyo.units.mol,
+            )
+            self.int_energy_density = pyo.Var(
+                tset,
+                ixnodes,
+                iznodes,
+                doc="Fluid molar internal energy density at node centers",
+                units=pyo.units.J / pyo.units.m ** 3,
+            )
+            self.int_energy_density_solid = pyo.Var(
+                tset,
+                ixnodes,
+                iznodes,
+                doc="Internal energy density of solid electrode",
+                units=pyo.units.J / pyo.units.m ** 3,
+            )
         self.pressure = pyo.Var(
             tset, ixnodes, iznodes, doc="Pressure at node centers", units=pyo.units.Pa,
             bounds = (0,None)
@@ -2219,7 +1788,7 @@ class SocElectrodeData(UnitModelBlockData):
         self.solid_thermal_conductivity = pyo.Var()
 
         # Add time derivative varaible if steady state use const 0.
-        if is_dynamic:
+        if dynamic:
             self.dDconcdt = DerivativeVar(
                 self.Dconc,
                 wrt=tset,
@@ -2237,7 +1806,7 @@ class SocElectrodeData(UnitModelBlockData):
                 units=pyo.units.mol / pyo.units.m ** 3 / pyo.units.s,
             )
         # Add time derivative varaible if steady state use const 0.
-        if is_dynamic:
+        if dynamic:
             self.dcedt = DerivativeVar(
                 self.int_energy_density,
                 wrt=tset,
@@ -2253,7 +1822,7 @@ class SocElectrodeData(UnitModelBlockData):
                 units=pyo.units.W / pyo.units.m ** 3,
             )
         # Add time derivative varaible if steady state use const 0.
-        if is_dynamic:
+        if dynamic:
             self.dcedt_solid = DerivativeVar(
                 self.int_energy_density_solid,
                 wrt=tset,
@@ -2337,37 +1906,39 @@ class SocElectrodeData(UnitModelBlockData):
                 * b.mole_frac_comp[t, ix, iz, i]
                 for i in comps
             )
+        if self.config.has_holdup:
+            # For the vapor phase
+            @self.Constraint(tset, ixnodes, iznodes)
+            def int_energy_mol_eqn(b, t, ix, iz):
+                return b.int_energy_mol[t, ix, iz] == sum(
+                    comp_int_energy_expr(b.temperature[t, ix, iz], i)
+                    * b.mole_frac_comp[t, ix, iz, i]
+                    for i in comps
+                )
+    
+            @self.Constraint(tset, ixnodes, iznodes)
+            def int_energy_density_eqn(b, t, ix, iz):
+                return (
+                    b.int_energy_density[t, ix, iz]
+                    == b.int_energy_mol[t, ix, iz] / b.volume_molar[t, ix, iz]
+                )
+    
+            @self.Constraint(tset, ixnodes, iznodes)
+            def int_energy_density_solid_eqn(b, t, ix, iz):
+                return b.int_energy_density_solid[
+                    t, ix, iz
+                ] == b.solid_heat_capacity * b.solid_density * (
+                    b.temperature[t, ix, iz] - 1000 * pyo.units.K
+                )
 
-        @self.Expression(tset, iznodes)
-        def enth_mol_x0(b, t, iz):
-            return sum(
-                comp_enthalpy_expr(b.temperature_x0[t, iz], i) * b.conc_x0[t, iz, i]
-                for i in comps
-            ) / sum(b.conc_x0[t, iz, i] for i in comps)
-
-        @self.Constraint(tset, ixnodes, iznodes)
-        def int_energy_mol_eqn(b, t, ix, iz):
-            return b.int_energy_mol[t, ix, iz] == sum(
-                comp_int_energy_expr(b.temperature[t, ix, iz], i)
-                * b.mole_frac_comp[t, ix, iz, i]
-                for i in comps
-            )
-
-        @self.Constraint(tset, ixnodes, iznodes)
-        def int_energy_density_eqn(b, t, ix, iz):
-            return (
-                b.int_energy_density[t, ix, iz]
-                == b.int_energy_mol[t, ix, iz] / b.volume_molar[t, ix, iz]
-            )
-
-        @self.Constraint(tset, ixnodes, iznodes)
-        def int_energy_density_solid_eqn(b, t, ix, iz):
-            return b.int_energy_density_solid[
-                t, ix, iz
-            ] == b.solid_heat_capacity * b.solid_density * (
-                b.temperature[t, ix, iz] - 1000 * pyo.units.K
-            )
-
+        # @self.Constraint(tset, ixnodes, iznodes)
+        # def int_energy_density_eqn(b, t, ix, iz):
+        #     return (
+        #         b.int_energy_density[t, ix, iz]
+        #         == b.porosity * b.int_energy_mol[t, ix, iz] / b.volume_molar[t, ix, iz]
+        #         + (1 - b.porosity) * b.int_energy_density_solid[t, ix, iz]
+        #     )
+                
         @self.Constraint(tset, ixnodes, iznodes)
         def mole_frac_eqn(b, t, ix, iz):
             return 1 == sum(b.mole_frac_comp[t, ix, iz, i] for i in comps)
@@ -2477,7 +2048,7 @@ class SocElectrodeData(UnitModelBlockData):
                 faces=zfaces,
                 phi_func=lambda izf: b.diff_eff_coeff[t, ix, izf, i],
                 phi_bound_0=0,  # solid wall no flux
-                phi_bound_1=0,  # reactions at this bound this is not used
+                phi_bound_1=0,  # solid wall no flux
                 derivative=False,
             )
 
@@ -2506,14 +2077,6 @@ class SocElectrodeData(UnitModelBlockData):
                 phi_bound_1=b.temperature[t, ix, iznodes.last()],
                 derivative=False,
             )
-
-        # @self.Constraint(tset, iznodes, comps)
-        # def conc_x1_eqn(b, t, iz, i):
-        #     return (
-        #         b.xflux[t, ixfaces.last(), iz, i]
-        #         == -b.dcdx[t, ixfaces.last(), iz, i]
-        #         * b.diff_eff_coeff_xfaces[t, ixfaces.last(), iz, i]
-        #     )
 
         @self.Expression(tset, ixfaces, iznodes, comps)
         def xflux(b, t, ix, iz, i):
@@ -2586,12 +2149,11 @@ class SocElectrodeData(UnitModelBlockData):
 
         @self.Constraint(tset, ixnodes, iznodes, comps)
         def material_balance_eqn(b, t, ix, iz, i):
-            # if is_dynamic and t == tset.first():
-            #     return pyo.Constraint.Skip
             return b.node_volume[ix, iz] * b.dcdt[t, ix, iz, i] == b.xface_area[iz] * (
                 b.xflux[t, ix, iz, i] - b.xflux[t, ix + 1, iz, i]
             ) + b.zface_area[ix] * (b.zflux[t, ix, iz, i] - b.zflux[t, ix, iz + 1, i])
-        if is_dynamic:
+
+        if dynamic:
             self.material_balance_eqn[tset.first(),:,:,:].deactivate()
             
         @self.Expression(tset, ixnodes, iznodes)
@@ -2600,10 +2162,9 @@ class SocElectrodeData(UnitModelBlockData):
 
         @self.Constraint(tset, ixnodes, iznodes)
         def energy_balance_solid_eqn(b, t, ix, iz):
-            # if is_dynamic and t == tset.first():
-            #     return pyo.Constraint.Skip
             return (
-                b.node_volume[ix, iz] * ((1 - b.porosity) * b.dcedt_solid[t, ix, iz] + b.porosity * b.dcedt[t, ix, iz])
+                b.node_volume[ix, iz] * (b.porosity * b.dcedt[t, ix, iz]
+                 + (1-b.porosity) * b.dcedt_solid[t, ix, iz])
                 == b.xface_area[iz] * (b.qxflux[t, ix, iz] - b.qxflux[t, ix + 1, iz])
                 + b.zface_area[ix] * (b.qzflux[t, ix, iz] - b.qzflux[t, ix, iz + 1])
                 + b.joule_heating[t, ix, iz]
@@ -2635,17 +2196,20 @@ class SocElectrodeData(UnitModelBlockData):
                     for i in comps
                 )
             )
-        if is_dynamic:
+        if dynamic:
             self.energy_balance_solid_eqn[tset.first(),:,:].deactivate()
-    def initialize(
+    def initialize_build(
         self,
-        outlvl=idaeslog.DEBUG,
+        outlvl=idaeslog.NOTSET,
         solver=None,
         optarg=None,
         temperature_guess=None,
         pressure_guess=None,
         mole_frac_guess=None,
-    ):
+        ):
+        init_log = idaeslog.getInitLogger(self.name, outlvl, tag="unit")
+        solve_log = idaeslog.getSolveLogger(self.name, outlvl, tag="unit")
+        
         comps = self.config.comp_list
         # Use conc_x0 and the temperature guess to start filling in initial
         # guess values.
@@ -2684,160 +2248,34 @@ class SocElectrodeData(UnitModelBlockData):
                             for i in comps
                         ),
                     )
-                    _set_if_unfixed(
-                        self.int_energy_mol[t, ix, iz],
-                        sum(
-                            comp_int_energy_expr(self.temperature[t, ix, iz], i)
-                            * self.mole_frac_comp[t, ix, iz, i]
-                            for i in comps
-                        ),
-                    )
-                    _set_if_unfixed(
-                        self.int_energy_density[t, ix, iz],
-                        self.int_energy_mol[t, ix, iz] / self.volume_molar[t, ix, iz],
-                    )
-                    # _set_if_unfixed(
-                    #    self.int_energy_density_solid[t, ix, iz],
-                    #    self.solid_heat_capacity * self.solid_density * (self.temperature[t, ix, iz] - 1000 * pyo.units.K)
-                    # )
+                    if self.config.has_holdup:
+                        _set_if_unfixed(
+                            self.int_energy_mol[t, ix, iz],
+                            sum(
+                                comp_int_energy_expr(self.temperature[t, ix, iz], i)
+                                * self.mole_frac_comp[t, ix, iz, i]
+                                for i in comps
+                            ),
+                        )
+                        _set_if_unfixed(
+                            self.int_energy_density[t, ix, iz],
+                            self.int_energy_mol[t, ix, iz] / self.volume_molar[t, ix, iz],
+                        )
+                        # _set_if_unfixed(
+                        #    self.int_energy_density_solid[t, ix, iz],
+                        #    self.solid_heat_capacity * self.solid_density * (self.temperature[t, ix, iz] - 1000 * pyo.units.K)
+                        # )
                 for i in comps:
                     _set_if_unfixed(
                         self.Dconc_x1[t, iz, i], self.Dconc[t, self.ixnodes.last(), iz, i]
                     )
-        # self.Dtemp_x0.fix()
-        # self.conc_ref.fix()
-        # self.qflux_x0.fix()
-        #self.xflux_x0.fix()
-        assert mstat.degrees_of_freedom(self) == 0
-        solver = get_solver(solver, optarg)
-        results = solver.solve(self, tee=True)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
-        # self.Dtemp_x0.unfix()
-        # self.conc_ref.unfix()
-        # self.qflux_x0.unfix()
-        #self.xflux_x0.unfix()
+
+        slvr = get_solver(solver, optarg)
+        _init_solve_block(self, slvr, solve_log)
 
     def calculate_scaling_factors(self):
-        pass # use recursive scaling instead
-        # gsf = iscale.get_scaling_factor
-        # cst = iscale.constraint_scaling_transform
-        # # Base default scaling on typical conditions and dimensions
-        # sp = _scaling_factor_pressure # Pressure
-        # sx = 1 # Mole fraction
-        # sT = _scaling_factor_temperature_conduction # Temperature
-        # sR = 1  # Gas constant
-        # sD = 1e5 # Diffusion constant
-        
-        # s_length_y = 1 / pyo.value(self.length_y[None])
-        # s_length_z = 1 / pyo.value(self.length_z[None])
-        # s_length_x = 1 / pyo.value(self.length_x[None])
-        # sDx = s_length_x*len(self.ixnodes)
-        # sDz = s_length_z*len(self.iznodes)
-        
-        # sc = _scaling_factor_Dconcentration#sD/sDx # Concentration---base scaling off of flux eqns
-        # delCx = 0.037 #0.0066 0.027
-        # delCz = 4.03 #0.868 1.67
-        # sxflux = sD/(sDx*delCx) # Mole flux
-        # szflux = sD/(sDz*delCz)
-        
-        # _set_default_factor(self.pressure, sp)
-        # _set_default_factor(self.mole_frac_comp,10)
-        # _set_default_factor(self.temperature_z, _scaling_factor_temperature_thermo)
-        # _set_default_factor(self.Dtemp, _scaling_factor_temperature_conduction)
-        # _set_default_factor(self.Dtemp_x0, _scaling_factor_temperature_conduction)
-        # _set_default_factor(self.Dtemp_x1, _scaling_factor_temperature_conduction)
-        # _set_default_factor(self.Dconc, sc)
-        # _set_default_factor(self.Dconc_x1, sc)
-        # _set_default_factor(self.xflux_x0, sxflux)
-        # _set_default_factor(self.xflux_x1, sxflux)
-        # _set_default_factor(self.zflux, szflux)
-        
-        # _set_default_factor(self.int_energy_density_solid, _scaling_factor_energy*1e-2)
-        # _set_default_factor(self.int_energy_density, _scaling_factor_energy*1e-1)
-        # _set_default_factor(self.int_energy_mol, _scaling_factor_energy*1e-1)
-        # _set_default_factor(self.enth_mol, _scaling_factor_energy)
-        
-        # _set_default_factor(self.length_x, s_length_x)
-        # _set_default_factor(self.length_y, s_length_y)
-        # _set_default_factor(self.length_z, s_length_z)
+        pass
 
-        
-        # iscale.propagate_indexed_component_scaling_factors(self)
-        # # estimate conc scaling
-        
-        # for (t, ix, iz, j), c in self.conc_eqn.items():
-        #     sP = iscale.get_scaling_factor(self.pressure[t,ix,iz])
-        #     sx = iscale.get_scaling_factor(self.mole_frac_comp[t,ix,iz,j])
-        #     #if iscale.get_scaling_factor(c) is None:
-        #     # Temperature really needs two different scaling coeffs---
-        #     # one for absolute temperature and one for temperature
-        #     # differences
-        #         #iscale.set_scaling_factor(c, sc*sR*sT*1e-1)
-        #     cst(c,
-        #         sP*sx,
-        #         overwrite=False)
-
-        # for i, c in self.energy_balance_solid_eqn.items():
-        #     # TODO automate
-        #     #if iscale.get_scaling_factor(c) is None:
-        #     cst(c,1e2, overwrite=False)
-
-        # # for (t, ix, iz, i), v in self.xflux.items():
-        # #     if iscale.get_scaling_factor(v) is None:
-        # #         sc = iscale.get_scaling_factor(self.conc[t,ix,iz,i])
-        # #         # TODO figure out how to get this automatically
-        # #         sD = 1E4
-        # #         iscale.set_scaling_factor(v,sD*sc/s_deltax)
-                
-        # # for (t, ix, iz, i), v in self.zflux.items():
-        # #     if iscale.get_scaling_factor(v) is None:
-        # #         sc = iscale.get_scaling_factor(self.conc[t,ix,iz,i])
-        # #         # TODO figure out how to get this automatically
-        # #         sD = 1E4
-        # #         iscale.set_scaling_factor(v,sD*sc/s_deltaz)
-
-        # for (t, ix, j), c in self.xflux_x0_eqn.items():
-        #     sflux = iscale.get_scaling_factor(self.xflux_x0[t,ix,j])
-        #     cst(c, sflux, overwrite = False)
-            
-        # for (t, ix, j), c in self.xflux_x1_eqn.items():
-        #     sflux = iscale.get_scaling_factor(self.xflux_x1[t,ix,j])
-        #     cst(c, sflux, overwrite = False)
-
-        # for i, c in self.enth_mol_eqn.items():
-        #     s = iscale.get_scaling_factor(self.enth_mol[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.int_energy_mol_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_mol[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.int_energy_density_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_density[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.int_energy_density_solid_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_density_solid[i])
-        #     iscale.constraint_scaling_transform(c, s)
-        
-        # for (t, ix, iz, i), c in self.material_balance_eqn.items():
-        #     sq = iscale.get_scaling_factor(self.xflux[t,ix,iz,i])
-        #     # iscale.constraint_scaling_transform(
-        #     #     self.material_balance_eqn[t, ix, iz, i],
-        #     #     sq*s_length_y*s_length_z
-        #     # )
-        #     cst(c,3E4)
-        
-        # for i, c in self.qflux_x0_eqn.items():
-        #     # TODO automate. Around 20-150 W/m**2
-        #     cst(c, 1e-2, overwrite=False)
-            
-        # for i, c in self.qflux_x1_eqn.items():
-        #     # TODO automate
-        #     iscale.constraint_scaling_transform(c, 1e-2)
-            
-            
     def model_check(self, steady_state=True):
         comp_set = set(self.comps)
         elements_present = set()
@@ -2872,9 +2310,10 @@ class SocElectrodeData(UnitModelBlockData):
                              1e-8) #FIXME justify this number
                 fraction_change = pyo.value((sum_out - sum_in)/normal)
                 if abs(fraction_change) > 3e-3 :
-                    print(f"{element} is not being conserved; fractional "
-                          f"change {fraction_change}")
-                    raise RuntimeError
+                    raise RuntimeError(
+                        f"{element} is not being conserved in {self.name}; "
+                        f"fractional change {fraction_change}"
+                    )
             enth_in = 0
             enth_out = 0
             
@@ -2899,9 +2338,10 @@ class SocElectrodeData(UnitModelBlockData):
             fraction_change = pyo.value((enth_out - enth_in 
                                          - total_joule_heating)/normal) 
             if abs(fraction_change) > 3e-3:
-                print("Energy is not being conserved; fractional "
-                      f"change {fraction_change}")
-                raise RuntimeError
+                raise RuntimeError(
+                    f"Energy is not being conserved in {self.name}; "
+                    f"fractional change {fraction_change}"    
+                )
     def recursive_scaling(self):
         gsf = iscale.get_scaling_factor
         ssf = _set_scaling_factor_if_none
@@ -2921,21 +2361,21 @@ class SocElectrodeData(UnitModelBlockData):
         for t in self.flowsheet().time:
             for iz in self.iznodes:
                 if not self.temperature_z[t,iz].is_reference():
-                    sT = sgsf(self.temperature_z[t,iz],1e-2)
+                    sT = sgsf(self.temperature_z[t,iz], 1e-2)
                     
                 if self.qflux_x0[t,iz].is_reference():
-                    sq0 = gsf(self.qflux_x0[t,iz],default=1e-2)
+                    sq0 = gsf(self.qflux_x0[t,iz].referent, default=1e-2)
                 else:
-                    sq0 = sgsf(self.qflux_x0[t,iz],1e-2)
+                    sq0 = sgsf(self.qflux_x0[t,iz], 1e-2)
                 cst(self.qflux_x0_eqn[t,iz],sq0)
                 if not self.Dtemp_x0.is_reference():
                     ssf(self.Dtemp_x0,sq0*sLx/sk)
                 
                 
                 if self.qflux_x1[t,iz].is_reference():
-                    sq1 = gsf(self.qflux_x1[t,iz],default=1e-2)
+                    sq1 = gsf(self.qflux_x1[t,iz].referent ,default=1e-2)
                 else:
-                    sq1 = sgsf(self.qflux_x1[t,iz],1e-2)
+                    sq1 = sgsf(self.qflux_x1[t,iz], 1e-2)
                 cst(self.qflux_x1_eqn[t,iz],sq1)
                 if not self.Dtemp_x1.is_reference():
                     ssf(self.Dtemp_x1,sq1*sLx/sk)
@@ -2948,23 +2388,23 @@ class SocElectrodeData(UnitModelBlockData):
                     #ssf(self.conc_ref[t,iz,j],sy_def*1e-4/(sR*sT))
                     
                     if self.xflux_x0[t,iz,j].is_reference():
-                        sxflux0 = gsf(self.xflux_x0[t,iz,j],default=1e-2)
+                        sxflux0 = gsf(self.xflux_x0[t,iz,j].referent, default=1e-2)
                     else:
-                        sxflux0 = sgsf(self.xflux_x0[t,iz,j],1e-2)
-                    cst(self.xflux_x0_eqn[t,iz,j],sxflux0)
+                        sxflux0 = sgsf(self.xflux_x0[t,iz,j], 1e-2)
+                    cst(self.xflux_x0_eqn[t,iz,j], sxflux0)
                     if not self.Dconc_x0[t,iz,j].is_reference():
-                        ssf(self.Dconc_x0[t,iz,j],sxflux0*sLx/sD)
+                        ssf(self.Dconc_x0[t,iz,j], sxflux0*sLx/sD)
                     
                     if self.xflux_x1[t,iz,j].is_reference():
-                        sxflux1 = gsf(self.xflux_x1[t,iz,j],default=1e-2)
+                        sxflux1 = gsf(self.xflux_x1[t,iz,j].referent, default=1e-2)
                     else:
-                        sxflux1 = sgsf(self.xflux_x1[t,iz,j],1e-2)
+                        sxflux1 = sgsf(self.xflux_x1[t,iz,j], 1e-2)
                     cst(self.xflux_x1_eqn[t,iz,j],sxflux1)
                     
                     if not self.Dconc_x1[t,iz,j].is_reference():
-                        ssf(self.Dconc_x1[t,iz,j],sxflux1*sLx/sD)
+                        ssf(self.Dconc_x1[t,iz,j], sxflux1*sLx/sD)
                     
-                    sxflux[j] = min(sxflux0,sxflux1)
+                    sxflux[j] = min(sxflux0, sxflux1)
                 
                 for ix in self.ixnodes:
                     sP = sgsf(self.pressure[t,ix,iz],1e-4)
@@ -2974,16 +2414,17 @@ class SocElectrodeData(UnitModelBlockData):
                     sH = sgsf(self.enth_mol[t,ix,iz],sH)
                     cst(self.enth_mol_eqn[t,ix,iz],sH)
                     
-                    sU = sgsf(self.int_energy_mol[t,ix,iz],sH)
-                    cst(self.int_energy_mol_eqn[t,ix,iz],sU)
-                    
-                    s_rho_U = sgsf(self.int_energy_density[t,ix,iz],sU/sV)
-                    cst(self.int_energy_density_eqn[t,ix,iz],s_rho_U)
-                    
-                    s_rho_U_solid = sgsf(self.int_energy_density_solid[t,ix,iz],
-                                         1/(self.solid_heat_capacity.value
-                                            *self.solid_density.value*sDT))
-                    cst(self.int_energy_density_solid_eqn[t,ix,iz],s_rho_U_solid)
+                    if self.config.has_holdup:
+                        sU = sgsf(self.int_energy_mol[t,ix,iz],sH)
+                        cst(self.int_energy_mol_eqn[t,ix,iz],sU)
+                        
+                        s_rho_U = sgsf(self.int_energy_density[t,ix,iz],sU/sV)
+                        cst(self.int_energy_density_eqn[t,ix,iz],s_rho_U)
+                        
+                        s_rho_U_solid = sgsf(self.int_energy_density_solid[t,ix,iz],
+                                             1/(self.solid_heat_capacity.value
+                                                *self.solid_density.value*sDT))
+                        cst(self.int_energy_density_solid_eqn[t,ix,iz],s_rho_U_solid)
                     
                     cst(self.mole_frac_eqn[t,ix,iz],1)
                     cst(self.energy_balance_solid_eqn[t,ix,iz],sqx*sLy*sLz)
@@ -3052,7 +2493,7 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
         super().build()
         
         # Set up some sets for the space and time indexing
-        is_dynamic = self.config.dynamic
+        dynamic = self.config.dynamic
         tset = self.flowsheet().config.time
         # z coordinates for nodes and faces
         zfaces = self.config.cv_zfaces
@@ -3073,18 +2514,7 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
         self.reacting_gases = {j for j in comps 
                                if j not in self.inert_comps}
         
-        # self.xfaces = pyo.Set(initialize=self.config.cv_xfaces)
-        # self.xnodes = pyo.Set(
-        #     initialize=[
-        #         (self.xfaces.at(i) + self.xfaces.at(i + 1)) / 2.0
-        #         for i in range(1, len(self.xfaces))
-        #     ]
-        # )
-        # This sets provide an integer index for nodes and faces
-        # izfaces = self.izfaces = pyo.Set(initialize=range(1, len(self.zfaces) + 1))
         iznodes = self.iznodes = pyo.Set(initialize=range(1, len(self.znodes) + 1))
-        # self.ixfaces = pyo.Set(initialize=range(1, len(self.xfaces) + 1))
-        # self.ixnodes = pyo.Set(initialize=range(1, len(self.xnodes) + 1))
 
         _submodel_boilerplate_create_if_none(self)
         _create_thermal_boundary_conditions_if_none(self, thin=True)
@@ -3132,20 +2562,12 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
                                         bounds = (0,None)
                                         )
         
-        
         self.exchange_current_activation_energy = pyo.Var(
                                         initialize=0,
                                         units=pyo.units.J/pyo.units.mol,
                                         bounds = (0,None)
                                         )
-        
-        # @self.Expression(tset,iznodes)
-        # def temperature(b, t, iz):
-        #     if self.config.include_temperature_x_thermo:
-        #         return b.temperature_z[t,iz] + b.Dtemp[t,iz]
-        #     else:
-        #         return b.temperature_z[t,iz]
-        
+
         @self.Expression(tset,iznodes, comps)
         def conc(b, t, iz, j):
             return b.conc_ref[t, iz, j] + b.Dconc[t, iz, j]
@@ -3247,11 +2669,14 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
                 return b.xflux[t,iz,j] == -b.reaction_rate_per_unit_area[t,iz]*b.tpb_stoich[j]
             else:
                 return b.xflux[t,iz,j] == b.reaction_rate_per_unit_area[t,iz]*b.tpb_stoich[j]
-    def initialize(self,
-                outlvl=idaeslog.DEBUG,
+    def initialize_build(self,
+                outlvl=idaeslog.NOTSET,
                 solver=None,
                 optarg=None,
                 fix_x0=False):
+        init_log = idaeslog.getInitLogger(self.name, outlvl, tag="unit")
+        solve_log = idaeslog.getSolveLogger(self.name, outlvl, tag="unit")
+        
         self.Dtemp.fix()
         self.conc_ref.fix()
         self.Dconc.fix()
@@ -3269,13 +2694,9 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
                         self.conc[t,iz,j]/denom)
                     self.log_mole_frac_comp[t,iz,j].value = pyo.value(
                         pyo.log(self.mole_frac_comp[t,iz,j]))
-        
-        assert mstat.degrees_of_freedom(self) == 0
-        solver = get_solver(solver, optarg)
-        results = solver.solve(self,tee=False)
-        assert (results.solver.termination_condition 
-                == pyo.TerminationCondition.optimal)
-        assert results.solver.status == pyo.SolverStatus.ok
+
+        slvr = get_solver(solver, optarg)
+        _init_solve_block(self, slvr, solve_log)
         
         self.Dtemp.unfix()
         self.conc_ref.unfix()
@@ -3284,25 +2705,11 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
             self.qflux_x0.unfix()
         else:
             self.qflux_x1.unfix()
-        
-        
 
         
     def calculate_scaling_factors(self):
-        pass # use recursive scaling instead
-        # gsf = iscale.get_scaling_factor
-        # cst = iscale.constraint_scaling_transform
-        # sdf = _set_default_factor
-        # sdf(self.qflux_x1, 1e-2)
-        
-        # # for idx, con in self.exchange_current_eqn.items():
-        # #     #TODO Should get this from current density, but that gets set later
-            
-        # #     #f = gsf(self.current_density[idx], warning=True)
-        # #     cst (con,1e-3,overwrite=False)
-        # for i, c in self.qflux_eqn.items():
-        #     # TODO automate
-        #     iscale.constraint_scaling_transform(c, 1e-2)
+        pass
+
     def recursive_scaling(self):
         gsf = iscale.get_scaling_factor
         ssf = _set_scaling_factor_if_none
@@ -3319,28 +2726,32 @@ class SocTriplePhaseBoundaryData(UnitModelBlockData):
         for t in self.flowsheet().time:
             for iz in self.iznodes:
                 ssf(self.activation_potential[t,iz], 10)
-                si = gsf(self.current_density[t,iz], default=1e-2)
+                if self.current_density[t,iz].is_reference():
+                    si = gsf(self.current_density[t,iz].referent, default=1e-2)
+                else:
+                    si = gsf(self.current_density[t,iz],
+                             default=1e-2, warning=True)
                 # TODO come back when I come up with a good formulation
                 cst(self.activation_potential_eqn[t,iz],si)
                 if self.qflux_x0[t,iz].is_reference():
-                    gsf(self.qflux_x0[t,iz],default=1e-2)
+                    gsf(self.qflux_x0[t,iz].referent, default=1e-2)
                 else:
-                    sqx0 = sgsf(self.qflux_x0[t,iz],1e-2)
+                    sqx0 = sgsf(self.qflux_x0[t,iz], 1e-2)
                 if self.qflux_x1[t,iz].is_reference():
-                    sqx1 = gsf(self.qflux_x1[t,iz],1e-2)
+                    sqx1 = gsf(self.qflux_x1[t,iz].referent, 1e-2)
                 else:
-                    sqx1 = sgsf(self.qflux_x1[t,iz],1e-2)
+                    sqx1 = sgsf(self.qflux_x1[t,iz], 1e-2)
                 sqx = min(sqx0,sqx1)
                 cst(self.qflux_eqn[t,iz],sqx)
                 for j in self.comps:
                     #TODO Come back with good formulation for trace components
                     # and scale DConc and Cref
                     sy = sgsf(self.mole_frac_comp[t,iz,j], sy_def)
-                    ssf(self.log_mole_frac_comp[t,iz,j],1)
-                    cst(self.mole_frac_comp_eqn[t,iz,j],sy)
-                    cst(self.log_mole_frac_comp_eqn[t,iz,j],sy)
-                    sxflux = sgsf(self.xflux[t,iz,j],1e-2)
-                    cst(self.xflux_eqn[t,iz,j],sxflux)
+                    ssf(self.log_mole_frac_comp[t,iz,j], 1)
+                    cst(self.mole_frac_comp_eqn[t,iz,j], sy)
+                    cst(self.log_mole_frac_comp_eqn[t,iz,j], sy)
+                    sxflux = sgsf(self.xflux[t,iz,j], 1e-2)
+                    cst(self.xflux_eqn[t,iz,j], sxflux)
 
 @declare_process_block_class("SocContactResistor")
 class SocContactResistorData(UnitModelBlockData):
@@ -3371,7 +2782,7 @@ class SocContactResistorData(UnitModelBlockData):
         super().build()
         
         # Set up some sets for the space and time indexing
-        is_dynamic = self.config.dynamic
+        dynamic = self.config.dynamic
         tset = self.flowsheet().config.time
         # z coordinates for nodes and faces
         zfaces =self.config.cv_zfaces
@@ -3381,18 +2792,8 @@ class SocContactResistorData(UnitModelBlockData):
                 for i in range(len(zfaces)-1)
             ]
         )
-        # self.xfaces = pyo.Set(initialize=self.config.cv_xfaces)
-        # self.xnodes = pyo.Set(
-        #     initialize=[
-        #         (self.xfaces.at(i) + self.xfaces.at(i + 1)) / 2.0
-        #         for i in range(1, len(self.xfaces))
-        #     ]
-        # )
         # This sets provide an integer index for nodes and faces
-        # izfaces = self.izfaces = pyo.Set(initialize=range(1, len(self.zfaces) + 1))
         iznodes = self.iznodes = pyo.Set(initialize=range(1, len(self.znodes) + 1))
-        # self.ixfaces = pyo.Set(initialize=range(1, len(self.xfaces) + 1))
-        # self.ixnodes = pyo.Set(initialize=range(1, len(self.xnodes) + 1))
 
         _submodel_boilerplate_create_if_none(self)
         _create_thermal_boundary_conditions_if_none(self, thin=True)
@@ -3405,12 +2806,6 @@ class SocContactResistorData(UnitModelBlockData):
         self.contact_fraction = pyo.Var(initialize=1,
                                           units=pyo.units.dimensionless,
                                           bounds = (0,1))
-        # @self.Expression(tset,iznodes)
-        # def temperature(b,t,iz):
-        #     if b.config.include_temperature_x_thermo:
-        #         return b.temperature_z[t,iz] + b.Dtemp[t,iz]
-        #     else:
-        #         return b.temperature_z[t,iz]
         
         @self.Expression(tset,iznodes)
         def contact_resistance(b,t,iz):
@@ -3433,23 +2828,23 @@ class SocContactResistorData(UnitModelBlockData):
         def qflux_eqn(b,t,iz):
             return b.qflux_x1[t,iz] == b.qflux_x0[t,iz] + b.joule_heating_flux[t,iz]
         
-    def initialize(self,
-                outlvl=idaeslog.DEBUG,
+    def initialize_build(self,
+                outlvl=idaeslog.NOTSET,
                 solver=None,
                 optarg=None,
                 fix_qflux_x0 = True):
+        init_log = idaeslog.getInitLogger(self.name, outlvl, tag="unit")
+        solve_log = idaeslog.getSolveLogger(self.name, outlvl, tag="unit")
+        
         self.Dtemp.fix()
         if fix_qflux_x0:
             self.qflux_x0.fix()
         else:
             self.qflux_x1.fix()
             
-        assert mstat.degrees_of_freedom(self) == 0
-        solver = get_solver(solver, optarg)
-        results = solver.solve(self,tee=False)
-        assert (results.solver.termination_condition 
-                == pyo.TerminationCondition.optimal)
-        assert results.solver.status == pyo.SolverStatus.ok
+        slvr = get_solver(solver, optarg)
+        _init_solve_block(self, slvr, solve_log)
+        
         self.Dtemp.unfix()
         if fix_qflux_x0:
             self.qflux_x0.unfix()
@@ -3457,17 +2852,20 @@ class SocContactResistorData(UnitModelBlockData):
             self.qflux_x1.unfix()
             
     def calculate_scaling_factors(self):
-        _set_default_factor(self.qflux_x0, 1e-2)
-        _set_default_factor(self.qflux_x1, 1e-2)
-        
-        for i, c in self.qflux_eqn.items():
-            # TODO automate
-            iscale.constraint_scaling_transform(c, 1e-2)
+        pass
             
     def recursive_scaling(self):
+        gsf = iscale.get_scaling_factor
         for i, c in self.qflux_eqn.items():
-            sq = iscale.min_scaling_factor([self.qflux_x0[i],
-                                            self.qflux_x1[i]])
+            if self.qflux_x0[i].is_reference():
+                sq0 = gsf(self.qflux_x0[i].referent)
+            else: 
+                sq0 = gsf(self.qflux_x0[i], warning=True)
+            if self.qflux_x1[i].is_reference():
+                sq1 = gsf(self.qflux_x1[i].referent)
+            else: 
+                sq1 = gsf(self.qflux_x1[i], warning=True)
+            sq = min(sq0, sq1)
             iscale.constraint_scaling_transform(c, sq, overwrite=False)
 
 @declare_process_block_class("SocConductiveSlab")
@@ -3505,7 +2903,7 @@ class SocConductiveSlabData(UnitModelBlockData):
         super().build()
         
         # Set up some sets for the space and time indexing
-        is_dynamic = self.config.dynamic
+        dynamic = self.config.dynamic
         tset = self.flowsheet().config.time
         # z coordinates for nodes and faces
         self.zfaces = pyo.Set(initialize=self.config.cv_zfaces)
@@ -3552,13 +2950,14 @@ class SocConductiveSlabData(UnitModelBlockData):
             tset, ixnodes, iznodes, initialize=0,
             doc="Temperature at node centers", units=pyo.units.K
         )
-        self.int_energy_density_solid = pyo.Var(
-            tset,
-            ixnodes,
-            iznodes,
-            doc="Internal energy density of solid electrode",
-            units=pyo.units.J / pyo.units.m ** 3,
-        )
+        if self.config.has_holdup:
+            self.int_energy_density_solid = pyo.Var(
+                tset,
+                ixnodes,
+                iznodes,
+                doc="Internal energy density of solid electrode",
+                units=pyo.units.J / pyo.units.m ** 3,
+            )
         self.resistivity_log_preexponential_factor = pyo.Var(
             doc= "Logarithm of resistivity preexponential factor "
                 "in units of ohm*m", 
@@ -3580,16 +2979,17 @@ class SocConductiveSlabData(UnitModelBlockData):
                 return b.temperature_z[t,iz] + b.Dtemp[t,ix,iz]
             else:
                 return b.temperature_z[t,iz]
-        
-        @self.Constraint(tset, ixnodes, iznodes)
-        def int_energy_density_solid_eqn(b, t, ix, iz):
-            return b.int_energy_density_solid[
-                t, ix, iz
-            ] == b.heat_capacity * b.density * (
-                b.temperature[t, ix, iz] - 1000 * pyo.units.K
-            )
 
-        if is_dynamic:
+        if self.config.has_holdup:
+            @self.Constraint(tset, ixnodes, iznodes)
+            def int_energy_density_solid_eqn(b, t, ix, iz):
+                return b.int_energy_density_solid[
+                    t, ix, iz
+                ] == b.heat_capacity * b.density * (
+                    b.temperature[t, ix, iz] - 1000 * pyo.units.K
+                )
+
+        if dynamic:
             self.dcedt_solid = DerivativeVar(
                 self.int_energy_density_solid,
                 wrt=tset,
@@ -3716,52 +3116,17 @@ class SocConductiveSlabData(UnitModelBlockData):
 
         @self.Constraint(tset, ixnodes, iznodes)
         def energy_balance_solid_eqn(b, t, ix, iz):
-            # if is_dynamic and t == tset.first():
-            #     return pyo.Constraint.Skip
             return (
                 b.node_volume[ix, iz] * b.dcedt_solid[t, ix, iz]
                 == b.xface_area[iz] * (b.qxflux[t, ix, iz] - b.qxflux[t, ix + 1, iz])
                 + b.zface_area[ix] * (b.qzflux[t, ix, iz] - b.qzflux[t, ix, iz + 1])
                 + b.joule_heating[t, ix, iz]
             )
-        if is_dynamic:
+        if dynamic:
             self.energy_balance_solid_eqn[tset.first(),:,:].deactivate()
 
-    def deactivate_internal_energy(self):
-        self.int_energy_density_solid.fix()
-        self.int_energy_density_solid_eqn.deactivate()
-
-    def activate_internal_energy(self):
-        self.int_energy_density_solid.unfix()
-        self.int_energy_density_solid_eqn.activate()
-
     def calculate_scaling_factors(self):
-        pass # use recursive scaling instead
-        # Base default scaling on typical conditions and dimensions
-        # _set_default_factor(self.int_energy_density_solid, 1E-7)
-        # _set_default_factor(self.Dtemp, _scaling_factor_temperature_conduction)
-        # _set_default_factor(self.current_density, 1e-3)
-
-        # iscale.propagate_indexed_component_scaling_factors(self)
-
-        # for i, c in self.energy_balance_solid_eqn.items():
-        #     # TODO automate
-        #     iscale.constraint_scaling_transform(c, 1e2)
-
-        # for i, c in self.int_energy_density_solid_eqn.items():
-        #     s = iscale.get_scaling_factor(self.int_energy_density_solid[i])
-        #     iscale.constraint_scaling_transform(c, s)
-
-        # for i, c in self.qflux_x0_eqn.items():
-        #     # TODO automate factor selection
-        #     # Scale is approx 100-1000 W/m**2
-        #     #iscale.constraint_scaling_transform(c, 1e-2)
-        #     iscale.constraint_scaling_transform(c, 1e-2)
-
-        # for i, c in self.qflux_x1_eqn.items():
-        #     # TODO automate
-        #     # Scale is approx 200-500 W/m**2
-        #     iscale.constraint_scaling_transform(c, 1e-2)
+        pass
 
     def model_check(self):
         pass
@@ -3787,19 +3152,19 @@ class SocConductiveSlabData(UnitModelBlockData):
         for t in self.flowsheet().time:
             for iz in self.iznodes:
                 if not self.temperature_z[t,iz].is_reference():
-                    sT = sgsf(self.temperature_z[t,iz],1e-2)
+                    sT = sgsf(self.temperature_z[t,iz], 1e-2)
                     
                 if self.qflux_x0[t,iz].is_reference():
-                    sq0 = gsf(self.qflux_x0[t,iz],default=1e-2)
+                    sq0 = gsf(self.qflux_x0[t,iz].referent, default=1e-2)
                 else:
-                    sq0 = sgsf(self.qflux_x0[t,iz],1e-2)
+                    sq0 = sgsf(self.qflux_x0[t,iz], 1e-2)
                 cst(self.qflux_x0_eqn[t,iz],sq0)
                 if not self.Dtemp_x0.is_reference():
-                    ssf(self.Dtemp_x0,sq0*sLx/sk)
+                    ssf(self.Dtemp_x0, sq0*sLx/sk)
                 
                 
                 if self.qflux_x1[t,iz].is_reference():
-                    sq1 = gsf(self.qflux_x1[t,iz],default=1e-2)
+                    sq1 = gsf(self.qflux_x1[t,iz].referent, default=1e-2)
                 else:
                     sq1 = sgsf(self.qflux_x1[t,iz],1e-2)
                 cst(self.qflux_x1_eqn[t,iz],sq1)
@@ -3812,14 +3177,15 @@ class SocConductiveSlabData(UnitModelBlockData):
                 
                 
                 for ix in self.ixnodes:
-                    sDT = sgsf(self.Dtemp[t,ix,iz],sqx*sLx/sk)
+                    sDT = sgsf(self.Dtemp[t,ix,iz], sqx*sLx/sk)
                     
-                    s_rho_U_solid = sgsf(self.int_energy_density_solid[t,ix,iz],
-                                         1/(self.heat_capacity.value
-                                            *self.density.value*sDT))
-                    cst(self.int_energy_density_solid_eqn[t,ix,iz],s_rho_U_solid)
+                    if self.config.has_holdup:
+                        s_rho_U_solid = sgsf(self.int_energy_density_solid[t,ix,iz],
+                                             1/(self.heat_capacity.value
+                                                *self.density.value*sDT))
+                        cst(self.int_energy_density_solid_eqn[t,ix,iz], s_rho_U_solid)
                     
-                    cst(self.energy_balance_solid_eqn[t,ix,iz],sqx*sLy*sLz)
+                    cst(self.energy_balance_solid_eqn[t,ix,iz], sqx*sLy*sLz)
                     
 
                 
@@ -3899,8 +3265,10 @@ class SolidOxideCellData(UnitModelBlockData):
                                 "electrode."),
     )
     CONFIG.declare(
-        "opposite_flow",
-        ConfigValue(default=False, description="If True use counter-current flow"),
+        "flow_pattern",
+        ConfigValue(default=HeatExchangerFlowPattern.countercurrent,
+                    domain=In(HeatExchangerFlowPattern),
+                    description="Co-current or counter-current flow pattern"),
     )
     CONFIG.declare(
         "flux_through_interconnect",
@@ -3958,6 +3326,17 @@ class SolidOxideCellData(UnitModelBlockData):
                                 units=pyo.units.m,
                                 bounds = (0,None))
 
+        if self.config.flow_pattern == HeatExchangerFlowPattern.cocurrent:
+            opposite_flow = False
+        elif self.config.flow_pattern == HeatExchangerFlowPattern.countercurrent:
+            opposite_flow = True
+        else:
+            raise ConfigurationError(
+                "{} SolidOxideCell only supports cocurrent and "
+                "countercurrent flow patterns, but flow_type configuration"
+                " argument was set to {}.".format(self.name, self.config.flow_pattern)
+            )
+
         self.fuel_chan = SocChannel(
             default={
                 "has_holdup": has_holdup,
@@ -3968,7 +3347,7 @@ class SolidOxideCellData(UnitModelBlockData):
                 "temperature_z": self.temperature_z,
                 "interpolation_scheme": CV_Interpolation.UDS,
                 "opposite_flow": False,
-                "above_electrode": False,
+                "below_electrode": True,
                 "comp_list": self.fuel_comps,
                 "include_temperature_x_thermo": include_temp_x_thermo
             }
@@ -4010,8 +3389,8 @@ class SolidOxideCellData(UnitModelBlockData):
                 "length_y": self.length_y,
                 "temperature_z": self.temperature_z,
                 "interpolation_scheme": CV_Interpolation.UDS,
-                "above_electrode": True,
-                "opposite_flow": self.config.opposite_flow,
+                "below_electrode": False,
+                "opposite_flow": opposite_flow,
                 "comp_list": self.oxygen_comps,
                 "include_temperature_x_thermo": include_temp_x_thermo
             }
@@ -4124,16 +3503,6 @@ class SolidOxideCellData(UnitModelBlockData):
                 "below_electrolyte": False,
             }
         )
-        # _make_electrochemistry(
-        #     self, tset, iznodes,
-        #     self.fuel_electrode.temperature_x1,
-        #     self.fuel_electrode.pressure_x1,
-        #     self.fuel_electrode.mole_frac_comp_x1,
-        #     self.fuel_comps,
-        #     self.oxygen_electrode.temperature_x1, 
-        #     self.oxygen_electrode.pressure_x1,
-        #     self.oxygen_electrode.mole_frac_comp_x1
-        #     )
         self.electrolyte = SocConductiveSlab(
             default={
                 "has_holdup": has_holdup,
@@ -4145,7 +3514,7 @@ class SolidOxideCellData(UnitModelBlockData):
                 "temperature_z": self.temperature_z,
                 "current_density": self.current_density,
                 "Dtemp_x0": self.fuel_electrode.Dtemp_x1,
-                "Dtemp_x1": self.oxygen_electrode.Dtemp_x1,
+                "Dtemp_x1": self.oxygen_electrode.Dtemp_x0,
                 "qflux_x0": self.fuel_tpb.qflux_x1,
                 "qflux_x1": self.oxygen_tpb.qflux_x0,
                 "include_temperature_x_thermo": include_temp_x_thermo
@@ -4192,24 +3561,17 @@ class SolidOxideCellData(UnitModelBlockData):
             @self.Constraint(tset, iznodes)
             def no_qflux_fuel_interconnect_eqn(b,t,iz):
                 return 0 == b.contact_interconnect_fuel_flow_mesh.qflux_x0[t,iz]
-            
+
             @self.Constraint(tset, iznodes)
             def no_qflux_oxygen_interconnect_eqn(b,t,iz):
                 return 0 == b.contact_interconnect_oxygen_flow_mesh.qflux_x1[t,iz]
-            
-            
+
         @self.Constraint(tset, iznodes)
         def mean_temperature_eqn(b,t,iz):
-            return 0 == (b.fuel_chan.Dtemp[t,iz] + b.oxygen_chan.Dtemp[t,iz]
-                    # + sum(b.fuel_electrode.Dtemp[t,ix,iz]
-                    #       for ix in b.fuel_electrode.ixnodes)
-                    # + sum(b.oxygen_electrode.Dtemp[t,ix,iz]
-                    #       for ix in b.oxygen_electrode.ixnodes)
-                    # + sum(b.electrolyte.Dtemp[t,ix,iz]
-                    #       for ix in b.electrolyte.ixnodes)
-                    )
+            return 0 == b.fuel_chan.Dtemp[t,iz] + b.oxygen_chan.Dtemp[t,iz]
+
         if dynamic:
-            self.mean_temperature_eqn[t0,:].deactivate()
+            self.mean_temperature_eqn[tset.first(),:].deactivate()
         @self.Constraint(tset, iznodes)
         def potential_eqn(b, t, iz):
             return (b.potential[t] == b.fuel_tpb.nernst_potential[t, iz] 
@@ -4225,60 +3587,11 @@ class SolidOxideCellData(UnitModelBlockData):
             return -sum(b.potential[t]
                        * b.electrolyte.current[t, iz] 
                        for iz in b.electrolyte.iznodes)
-        #_make_degradation_expressions(m,is_dynamic)
-    
-    def deactivate_internal_energy(self):
-        """
-        Deactivates all internal energy constraints and fixes all internal
-        energy variables (both gaseous and solid) for the cell submodels.
-        
-        Returns
-        -------
-        None.
-        
-        Internal energy constraints are useful only for the dynamics problem
-        or getting an initial condition for the dynamics problem. For a steady-
-        state optimization problem, they can be safely deactivated.
-        """
-    
-        for unit in [self.fuel_electrode, 
-                     self.oxygen_electrode, 
-                     self.electrolyte]:
-            unit.int_energy_density_solid.fix()
-            unit.int_energy_density_solid_eqn.deactivate()
-        for unit in [self.fuel_electrode, self.oxygen_electrode,
-                      self.fuel_chan, self.oxygen_chan]:
-            unit.int_energy_density.fix()
-            unit.int_energy_density_eqn.deactivate() 
 
-    def activate_internal_energy(self):
-        """
-        Activates all internal energy constraints and unfixes all internal
-        energy variables (both gaseous and solid) for the cell submodels.
-        
-        Returns
-        -------
-        None.
-        
-        Internal energy constraints are useful only for the dynamics problem
-        or getting an initial condition for the dynamics problem. For a steady-
-        state optimization problem, they can be safely deactivated.
-        """
-    
-        for unit in [self.fuel_electrode, 
-                     self.oxygen_electrode, 
-                     self.electrolyte]:
-            unit.int_energy_density_solid.unfix()
-            unit.int_energy_density_solid_eqn.activate()
-        for unit in [self.fuel_electrode, self.oxygen_electrode,
-                      self.fuel_chan, self.oxygen_chan]:
-            unit.int_energy_density.unfix()
-            unit.int_energy_density_eqn.activate()
-
-    def initialize(
+    def initialize_build(
         self,
         current_density_guess,
-        outlvl=idaeslog.DEBUG,
+        outlvl=idaeslog.NOTSET,
         solver=None,
         optarg=None,
         xflux_guess=None,
@@ -4287,6 +3600,8 @@ class SolidOxideCellData(UnitModelBlockData):
         temperature_guess=None,
         velocity_guess=None,
     ):
+        init_log = idaeslog.getInitLogger(self.name, outlvl, tag="unit")
+        solve_log = idaeslog.getSolveLogger(self.name, outlvl, tag="unit")
         tset = self.flowsheet().config.time
         #t0 = tset.first()
         
@@ -4310,53 +3625,63 @@ class SolidOxideCellData(UnitModelBlockData):
                     else:
                         unfix_inlet_var[pname][varname][t] = not var[t].fixed
                         var[t].fix()
-            
-        
-        
+
         unfix_potential = {}
-        solver = get_solver(solver, optarg)
+        slvr = get_solver(solver, optarg)
         for t in tset:
             unfix_potential[t] = not self.potential[t].fixed
-            #TODO is this necessary?
-            # self.potential[t].unfix()
         self.potential_eqn.deactivate()
         self.current_density.fix(current_density_guess)
-        
-        # self.fuel_tpb.exchange_current_potential.fix()
-        # self.fuel_tpb.exchange_current_eqn.deactivate()
-        
-        # self.oxygen_tpb.exchange_current_potential.fix()
-        # self.oxygen_tpb.exchange_current_eqn.deactivate()
-        
+
         self.temperature_z.fix(temperature_guess)
         self.mean_temperature_eqn.deactivate()
+
+        self.contact_interconnect_fuel_flow_mesh.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+            fix_qflux_x0=True
+        )
+        self.contact_interconnect_oxygen_flow_mesh.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+            fix_qflux_x0=False
+        )
         
-        self.contact_interconnect_fuel_flow_mesh.initialize(fix_qflux_x0=True)
-        self.contact_interconnect_oxygen_flow_mesh.initialize(fix_qflux_x0=False)
-        
-        print("Initializing Fuel Channel")
-        self.fuel_chan.xflux_x1.fix()
-        self.fuel_chan.qflux_x0.fix()
-        self.fuel_chan.qflux_x1.fix()
-        self.fuel_chan.initialize()
+        # Reset the fluxes to zero in case there are stale values
+        init_log.info_high("Initializing Fuel Channel")
+        self.fuel_chan.xflux_x1.fix(0)
+        self.fuel_chan.qflux_x0.fix(0)
+        self.fuel_chan.qflux_x1.fix(0)
+        self.fuel_chan.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+        )
         self.fuel_chan.xflux_x1.unfix()
         self.fuel_chan.qflux_x0.unfix()
         self.fuel_chan.qflux_x1.unfix()
-        print("Initializing Oxygen Channel")
-        self.oxygen_chan.xflux_x0.fix()
-        self.oxygen_chan.qflux_x0.fix()
-        self.oxygen_chan.qflux_x1.fix()
-        self.oxygen_chan.initialize()
+        
+        init_log.info_high("Initializing Oxygen Channel")
+        self.oxygen_chan.xflux_x0.fix(0)
+        self.oxygen_chan.qflux_x0.fix(0)
+        self.oxygen_chan.qflux_x1.fix(0)
+        self.oxygen_chan.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+        )
         self.oxygen_chan.xflux_x0.unfix()
         self.oxygen_chan.qflux_x0.unfix()
         self.oxygen_chan.qflux_x1.unfix()
         
-        print("Initializing Contact Resistors")
+        init_log.info_high("Initializing Contact Resistors")
         
-        self.contact_flow_mesh_fuel_electrode.initialize(fix_qflux_x0=True)
-        self.contact_flow_mesh_oxygen_electrode.initialize(fix_qflux_x0=False)
+        self.contact_flow_mesh_fuel_electrode.initialize_build(fix_qflux_x0=True)
+        self.contact_flow_mesh_oxygen_electrode.initialize_build(fix_qflux_x0=False)
         
-        print("Calculating reaction rate at current guess")
+        init_log.info_high("Calculating reaction rate at current guess")
         self.fuel_tpb.Dtemp.fix(0)
         self.fuel_tpb.Dconc.fix(0)
         self.fuel_tpb.conc_ref.fix()
@@ -4371,10 +3696,7 @@ class SolidOxideCellData(UnitModelBlockData):
                     self.fuel_tpb.log_mole_frac_comp[t,iz,j].value = pyo.value(
                         pyo.log(self.fuel_tpb.mole_frac_comp[t,iz,j]))
         
-        assert mstat.degrees_of_freedom(self.fuel_tpb) == 0
-        results = solver.solve(self.fuel_tpb, tee=False)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
+        _init_solve_block(self.fuel_tpb, slvr, solve_log)
         
         self.fuel_tpb.Dtemp.unfix()
         self.fuel_tpb.Dconc.unfix()
@@ -4394,18 +3716,15 @@ class SolidOxideCellData(UnitModelBlockData):
                         self.oxygen_tpb.conc[t,iz,j]/denom)
                     self.oxygen_tpb.log_mole_frac_comp[t,iz,j].value = pyo.value(
                         pyo.log(self.oxygen_tpb.mole_frac_comp[t,iz,j]))
-        
-        assert mstat.degrees_of_freedom(self.oxygen_tpb) == 0
-        results = solver.solve(self.oxygen_tpb, tee=False)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
-        
+
+        _init_solve_block(self.oxygen_tpb, slvr, solve_log)
+
         self.oxygen_tpb.Dtemp.unfix()
         self.oxygen_tpb.Dconc.unfix()
         self.oxygen_tpb.conc_ref.unfix()
         self.oxygen_tpb.qflux_x0.unfix()
         
-        print("Initializing Fuel Electrode")
+        init_log.info_high("Initializing Fuel Electrode")
         self.fuel_electrode.conc_ref.fix()
         self.fuel_electrode.Dconc_x0.fix()
         self.fuel_electrode.Dtemp_x0.fix()
@@ -4413,7 +3732,12 @@ class SolidOxideCellData(UnitModelBlockData):
         # self.fuel_electrode.Dconc_x0.fix()
         self.fuel_electrode.xflux_x1.fix()
         
-        self.fuel_electrode.initialize(temperature_guess=temperature_guess)
+        self.fuel_electrode.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+            temperature_guess=temperature_guess
+        )
         
         self.fuel_electrode.conc_ref.unfix()
         self.fuel_electrode.Dconc_x0.unfix()
@@ -4422,35 +3746,44 @@ class SolidOxideCellData(UnitModelBlockData):
         # self.fuel_electrode.Dconc_x0.unfix()
         self.fuel_electrode.xflux_x1.unfix()
         
-        print("Initializing Oxygen Electrode")
+        init_log.info_high("Initializing Oxygen Electrode")
         self.oxygen_electrode.conc_ref.fix()
         self.oxygen_electrode.Dconc_x1.fix()
         self.oxygen_electrode.Dtemp_x1.fix()
         self.oxygen_electrode.qflux_x1.fix()
-        # self.oxygen_electrode.Dconc_x1.fix()
         self.oxygen_electrode.xflux_x0.fix()
         
-        self.oxygen_electrode.initialize(temperature_guess=temperature_guess)
+        self.oxygen_electrode.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+            temperature_guess=temperature_guess
+        )
         
         self.oxygen_electrode.conc_ref.unfix()
         self.oxygen_electrode.Dconc_x1.unfix()
         self.oxygen_electrode.Dtemp_x1.unfix()
         self.oxygen_electrode.qflux_x1.unfix()
-        # self.oxygen_electrode.Dconc_x1.unfix()
         self.oxygen_electrode.xflux_x0.unfix()
         
-        print("Initializing Triple Phase Boundaries")
-        self.fuel_tpb.initialize(fix_x0=True)
-        self.oxygen_tpb.initialize(fix_x0=False)
+        init_log.info_high("Initializing Triple Phase Boundaries")
+        self.fuel_tpb.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,
+            fix_x0=True
+        )
+        self.oxygen_tpb.initialize_build(
+            outlvl=outlvl,
+            solver=solver,
+            optarg=optarg,fix_x0=False
+        )
         
         self.temperature_z.unfix()
         self.mean_temperature_eqn.activate()
         
-        assert(mstat.degrees_of_freedom(self)==0)
-        print("Solving cell with fixed current density")
-        results = solver.solve(self, tee=True)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
+        init_log.info_high("Solving cell with fixed current density")
+        _init_solve_block(self, slvr, solve_log)
         
         self.potential_eqn.activate()
         # TODO---does the user ever have a reason to fix current density
@@ -4458,11 +3791,8 @@ class SolidOxideCellData(UnitModelBlockData):
         self.current_density.unfix()
         self.potential.fix()
         
-        assert(mstat.degrees_of_freedom(self)==0)
-        print("Solving cell with potential equations active")
-        results = solver.solve(self, tee=True)
-        assert results.solver.termination_condition == pyo.TerminationCondition.optimal
-        assert results.solver.status == pyo.SolverStatus.ok
+        init_log.info_high("Solving cell with potential equations active")
+        _init_solve_block(self, slvr, solve_log)
         
         # Unfix any inlet variables that were fixed by initialization
         # To be honest, using a state block would probably have been less work
@@ -4484,25 +3814,10 @@ class SolidOxideCellData(UnitModelBlockData):
         for t in tset:
             if unfix_potential[t]:
                 self.potential[t].unfix()
+        init_log.info(f"{self.name} initialization completed successfully.")
     
     def calculate_scaling_factors(self):
-        pass # Use recursive scaling instead
-        # Base default scaling on typical conditions and dimensions
-        # sdf = _set_default_factor
-        # _set_default_factor(self.current_density, 1e-3)
-        # _set_default_factor(self.temperature_z,
-        #                     _scaling_factor_temperature_thermo)
-        
-        # s_length_z = 1 / pyo.value(self.length_z[None])
-        # s_length_y = 1 / pyo.value(self.length_y[None])
-        # sdf(self.length_z,s_length_z)
-        # sdf(self.length_y,s_length_y)
-        
-        
-        # iscale.propagate_indexed_component_scaling_factors(self)
-        # for (t,iz), c in self.mean_temperature_eqn.items():
-        #     #TODO automate
-        #     iscale.constraint_scaling_transform(c,1)
+        self.recursive_scaling()
             
     def model_check(self, steady_state=True):
         self.fuel_chan.model_check()
@@ -4550,9 +3865,10 @@ class SolidOxideCellData(UnitModelBlockData):
                         * chan.flow_mol_comp_inlet[t,j] for j in comps)
                 fraction_change = pyo.value((sum_out - sum_in)/sum_in)
                 if abs(fraction_change) > 1e-5 :
-                    print(f"{element} is not being conserved; fractional "
-                          f"change {fraction_change}")
-                    raise RuntimeError
+                    raise RuntimeError(
+                        f"{element} is not being conserved {self.name}; "
+                        f"fractional change {fraction_change}"
+                    )
                     
             enth_in = (self.fuel_chan.enth_mol_inlet[t]
                        * self.fuel_chan.flow_mol_inlet[t]
@@ -4571,33 +3887,11 @@ class SolidOxideCellData(UnitModelBlockData):
             fraction_change = pyo.value((enth_out - enth_in 
                                          - self.electrical_work[t])/normal) 
             if abs(fraction_change) > 3e-3:
-                print("Energy is not being conserved; fractional "
-                      f"change {fraction_change}")
-                raise RuntimeError
-           
-        
-        # TODO make this generic for more fuels
-        # if "H2" in self.fuel_comps:
-        #     for t, iz in self.oxygen_electrode.pressure_x1.keys():
-        #         assert (pyo.value(self.oxygen_electrode.pressure_x1[t, iz]
-        #             * self.oxygen_electrode.mole_frac_comp_x1[t, iz, "O2"]
-        #             / (1e5 * pyo.units.Pa)) #TODO hardcoded conversion to bar
-        #                 > _safe_sqrt_eps*100)
-        #         assert (pyo.value(self.fuel_electrode.mole_frac_comp_x1[t, iz, "H2"]
-        #                 * safe_sqrt(
-        #                     # TODO should this be pressure_x1 or pressure x0?
-        #                     self.oxygen_electrode.pressure_x1[t, iz]
-        #                     * self.oxygen_electrode.mole_frac_comp_x1[t, iz, "O2"]
-        #                     / (1e5 * pyo.units.Pa), #TODO hardcoded conversion to bar
-        #                     eps=_safe_sqrt_eps)
-        #                 / self.fuel_electrode.mole_frac_comp_x1[t, iz, "H2O"])
-        #                 > 100*_safe_log_eps)
-        #         assert(pyo.value(self.fuel_electrode.mole_frac_comp_x1[t, iz, "H2"])
-        #                > 100*_safe_log_eps)
-        #         assert(pyo.value(self.fuel_electrode.mole_frac_comp_x1[t, iz, "H2O"])
-        #                > 100*_safe_log_eps)
-        #         assert(pyo.value(self.oxygen_electrode.mole_frac_comp_x1[t, iz, "O2"])
-        #                > 100*_safe_log_eps)
+                raise RuntimeError(
+                    f"Energy is not being conserved in {self.name}; "
+                    f"fractional change {fraction_change}"
+                )
+
     def recursive_scaling(self):
         gsf = iscale.get_scaling_factor
         ssf = iscale.set_scaling_factor
@@ -4645,7 +3939,7 @@ class SolidOxideCellData(UnitModelBlockData):
                                 self.fuel_electrode.xflux_x1]:
                         if gsf(var[t,iz,j]) is None:
                             ssf(var[t,iz,j],s_flux_j)
-        
+                    ssf(self.fuel_tpb.mole_frac_comp[t,iz,j],sy_in_fuel[j])
                 for j in self.oxygen_comps:
                     if abs(self.oxygen_tpb.tpb_stoich[j]) > 1e-3:
                         s_flux_j = sy_in_oxygen[j] * s_react_flux
@@ -4656,8 +3950,10 @@ class SolidOxideCellData(UnitModelBlockData):
                                 self.oxygen_electrode.xflux_x0]:
                         if gsf(var[t,iz,j]) is None:
                             ssf(var[t,iz,j],s_flux_j)
-        
+                    ssf(self.oxygen_tpb.mole_frac_comp[t,iz,j],sy_in_oxygen[j])
+                            
                 s_q_flux = s_react_flux*1e-4 # Chosen heuristically based on TdS_rxn
+                # s_q_flux = s_react_flux*1e-6
                 for submodel in [self.fuel_chan,
                                  self.contact_interconnect_fuel_flow_mesh,
                                  self.contact_flow_mesh_fuel_electrode,
@@ -4685,268 +3981,17 @@ class SolidOxideCellData(UnitModelBlockData):
         for idx, con in self.mean_temperature_eqn.items():
             cst(con, 1, overwrite=False)
         
-        for submodel in [self.fuel_chan,
-                         self.contact_interconnect_fuel_flow_mesh,
-                         self.contact_flow_mesh_fuel_electrode,
-                         self.fuel_electrode,
-                         self.fuel_tpb,
-                         self.oxygen_chan,
-                         self.contact_interconnect_oxygen_flow_mesh,
-                         self.contact_flow_mesh_oxygen_electrode,
-                         self.oxygen_electrode,
-                         self.oxygen_tpb,
-                         self.electrolyte
-                         ]:
+        for submodel in [
+            self.fuel_chan,
+            self.contact_interconnect_fuel_flow_mesh,
+            self.contact_flow_mesh_fuel_electrode,
+            self.fuel_electrode,
+            self.fuel_tpb,
+            self.oxygen_chan,
+            self.contact_interconnect_oxygen_flow_mesh,
+            self.contact_flow_mesh_oxygen_electrode,
+            self.oxygen_electrode,
+            self.oxygen_tpb,
+            self.electrolyte
+        ]:
             submodel.recursive_scaling()
-        
-
-def cell_flowsheet(time_set):
-    from idaes.core import FlowsheetBlock
-    if len(time_set) == 1:
-        dynamic = False
-    else:
-        dynamic = True
-    time_nfe = len(time_set) - 1
-    t0 = time_set[0]
-    #time_set = [0, 600] if dynamic else [0]
-    #time_set = [60*i for i in range(11)]
-    zfaces = np.linspace(0, 1, 11).tolist()
-    xfaces_electrode = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 0.9, 1.0]
-    xfaces_electrolyte = [0.0, 0.25, 0.5, 0.75, 1.0]
-    
-    fuel_comps = ["H2","H2O"]
-    fuel_stoich_dict = {"H2": -0.5, "H2O": 0.5}
-    oxygen_comps = ["O2","H2O"]
-    oxygen_stoich_dict = {"O2": -0.25, "H2O": 0}
-    
-    m = pyo.ConcreteModel()
-    m.fs = FlowsheetBlock(
-        default={
-            "dynamic": dynamic,
-            "time_set": time_set,
-            "time_units": pyo.units.s,
-        }
-    )
-    m.fs.cell = SolidOxideCell(
-            default={
-                "has_holdup": True,
-                "cv_zfaces": zfaces,
-                "cv_xfaces_fuel_electrode": xfaces_electrode,
-                "cv_xfaces_oxygen_electrode": xfaces_electrode,
-                "cv_xfaces_electrolyte": xfaces_electrolyte,
-                "fuel_comps": fuel_comps,
-                "fuel_tpb_stoich_dict": fuel_stoich_dict,
-                "oxygen_comps": oxygen_comps,
-                "oxygen_tpb_stoich_dict": oxygen_stoich_dict,
-                "opposite_flow": True
-            }
-        )
-    
-    if dynamic:
-        pyo.TransformationFactory("dae.finite_difference").apply_to(
-            m.fs, nfe=time_nfe, wrt=m.fs.time, scheme="BACKWARD"
-        )
-        # Start from a steady state
-        ms.from_json(m, fname="save_steady.json.gz", wts=ms.StoreSpec.value())
-
-        # Copy initial conditions to rest of model for initialization
-        regular_vars, time_vars = flatten_dae_components(m, m.fs.time, pyo.Var)
-        m.fs.current_density.unfix()
-        m.fs.potential_eqn.activate()
-        for t in m.fs.time:
-            for v in time_vars:
-                if not v[t].fixed:
-                    v[t].set_value(pyo.value(v[m.fs.time.first()]))
-        m.fs.temperature_z[0,:].fix()
-        m.fs.fuel_chan.Dtemp[0, :].fix()
-        m.fs.fuel_chan.flow_mol[0, :].fix()
-        m.fs.fuel_chan.mole_frac_comp[0, :, "H2"].fix()
-        m.fs.oxygen_chan.Dtemp[0, :].fix()
-        m.fs.oxygen_chan.flow_mol[0, :].fix()
-        m.fs.oxygen_chan.mole_frac_comp[0, :, "O2"].fix()
-        m.fs.fuel_electrode.Dconc[0, :, :, :].fix()
-        m.fs.fuel_electrode.Dtemp[0, :, :].fix()
-        m.fs.oxygen_electrode.Dconc[0, :, :, :].fix()
-        m.fs.oxygen_electrode.Dtemp[0, :, :].fix()
-        m.fs.electrolyte.Dtemp[0, :, :].fix()
-        m.fs.potential.fix(1.285)
-        # for unit in [m.fs.fuel_electrode, m.fs.oxygen_electrode, m.fs.electrolyte]:
-        #     unit.int_energy_density_solid[0,:,:].fix()
-        # for unit in [m.fs.fuel_electrode, m.fs.oxygen_electrode]:
-        #     unit.int_energy_density[0,:,:].fix()
-        # for unit in [m.fs.fuel_chan, m.fs.oxygen_chan]:
-        #     unit.int_energy_density[0,:].fix()
-    else:
-        #m.fs.current_density.fix(-2400)
-        
-        m.fs.cell.fuel_chan_inlet.temperature[t0].fix(1023.15)
-        m.fs.cell.fuel_chan_inlet.flow_mol[t0].fix(6e-5)
-        m.fs.cell.fuel_chan_inlet.mole_frac_comp[t0, "H2"].fix(0.03)
-        m.fs.cell.fuel_chan_inlet.mole_frac_comp[t0, "H2O"].fix(0.97)
-        
-        m.fs.cell.oxygen_chan_inlet.temperature[t0].fix(1023.15)
-        m.fs.cell.oxygen_chan_inlet.flow_mol[t0].fix(6e-5)
-        m.fs.cell.oxygen_chan_inlet.mole_frac_comp[t0, "O2"].fix(0.15)
-        m.fs.cell.oxygen_chan_inlet.mole_frac_comp[t0, "H2O"].fix(0.85)
-
-
-
-    m.fs.cell.fuel_chan_inlet.pressure.fix(1.02e5)
-    m.fs.cell.fuel_chan.length_x.fix(0.002)
-    m.fs.cell.length_y.fix(0.05)
-    m.fs.cell.length_z.fix(0.05)
-    m.fs.cell.fuel_chan.htc.fix(100)
-
-    m.fs.cell.oxygen_chan_inlet.pressure.fix(1.02e5)
-    m.fs.cell.oxygen_chan.length_x.fix(0.002)
-    m.fs.cell.oxygen_chan.htc.fix(100)
-    
-    m.fs.cell.fuel_electrode.length_x.fix(1e-3)
-    m.fs.cell.fuel_electrode.porosity.fix(0.48)
-    m.fs.cell.fuel_electrode.tortuosity.fix(5.4)
-    m.fs.cell.fuel_electrode.solid_heat_capacity.fix(450)
-    m.fs.cell.fuel_electrode.solid_density.fix(3210.0)
-    m.fs.cell.fuel_electrode.solid_thermal_conductivity.fix(1.86)
-    m.fs.cell.fuel_electrode.a_res.fix(2.98e-5)
-    m.fs.cell.fuel_electrode.b_res.fix(-1392.0)
-    
-    m.fs.cell.oxygen_electrode.length_x.fix(20e-6)
-    m.fs.cell.oxygen_electrode.porosity.fix(0.35)
-    m.fs.cell.oxygen_electrode.tortuosity.fix(3.0)
-    m.fs.cell.oxygen_electrode.solid_heat_capacity.fix(430)
-    m.fs.cell.oxygen_electrode.solid_density.fix(3030)
-    m.fs.cell.oxygen_electrode.solid_thermal_conductivity.fix(5.84)
-    m.fs.cell.oxygen_electrode.a_res.fix(8.115e-5)
-    m.fs.cell.oxygen_electrode.b_res.fix(600.0)
-
-    m.fs.cell.electrolyte.length_x.fix(9e-6)
-    m.fs.cell.electrolyte.heat_capacity.fix(470)
-    m.fs.cell.electrolyte.density.fix(5160)
-    m.fs.cell.electrolyte.thermal_conductivity.fix(2.16)
-    m.fs.cell.electrolyte.a_res.fix(2.94e-5)
-    m.fs.cell.electrolyte.b_res.fix(10350.0)
-
-    m.fs.cell.fuel_electrode.kec.fix(1.35e10)
-    m.fs.cell.fuel_electrode.eec.fix(110000)
-    m.fs.cell.fuel_electrode.alpha.fix(0.4)
-    m.fs.cell.oxygen_electrode.kec.fix(26.1e8)
-    m.fs.cell.oxygen_electrode.eec.fix(120000)
-    m.fs.cell.oxygen_electrode.alpha.fix(0.5)
-
-
-    # use_idaes_solver_configuration_defaults()
-    # # see = pyo.TransformationFactory("simple_equality_eliminator")
-    # # see.apply_to(m)
-    # solver = pyo.SolverFactory("ipopt")
-
-    # # see.revert()
-    # # return m
-    
-    # if not dynamic:
-    #     print(mstat.degrees_of_freedom(m))
-    #     solver.solve(
-    #         m,
-    #         tee=True,
-    #         #symbolic_solver_labels=True,
-    #         #options={"tol": 1e-6, "halt_on_ampl_error": "no"},
-    #     )
-    #     m.fs.fuel_chan.temperature_inlet[t0].unfix()
-    #     m.fs.fuel_chan.flow_mol_inlet[t0].unfix()
-    #     m.fs.fuel_chan.mole_frac_comp_inlet[t0, "H2"].unfix()
-    #     m.fs.fuel_chan.mole_frac_comp_inlet[t0, "H2O"].unfix()
-        
-    #     m.fs.oxygen_chan.temperature_inlet[t0].unfix()
-    #     m.fs.oxygen_chan.flow_mol_inlet[t0].unfix()
-    #     m.fs.oxygen_chan.mole_frac_comp_inlet[t0, "O2"].unfix()
-    #     m.fs.oxygen_chan.mole_frac_comp_inlet[t0, "H2O"].unfix()
-    return m
-
-
-if __name__ == "__main__":
-    m = cell_flowsheet()
-
-    # m.fs.chan.temperature.display()
-    # m.fs.chan.mole_frac_comp.display()
-
-    print(binary_diffusion_coefficient_expr(590, 1e5, "CO2", "N2"))
-    print(pyo.value(comp_enthalpy_expr(1023.15, "H2O")) + 241.8264 * 1000)
-
-    for temperature in [273, 298, 300, 400, 500, 600, 700, 800, 900, 1000, 1100]:
-        ds = pyo.value(
-            comp_entropy_expr(temperature, "H2O")
-            - comp_entropy_expr(temperature, "H2")
-            - 0.5 * comp_entropy_expr(temperature, "O2")
-        )
-        dh = pyo.value(
-            comp_enthalpy_expr(temperature, "H2O")
-            - comp_enthalpy_expr(temperature, "H2")
-            - 0.5 * comp_enthalpy_expr(temperature, "O2")
-        )
-        dg = dh - temperature * ds
-        dg_approx = pyo.value(-2 * _constF * (1.253 - 0.00024516 * temperature))
-
-        print(f"{temperature}, {ds}, {dh}, {dg}, {dg_approx}")
-
-    m.fs.fuel_chan.mole_frac_comp.display()
-    m.fs.fuel_electrode.current_density.display()
-    m.fs.fuel_chan.temperature.display()
-    m.fs.oxygen_chan.temperature.display()
-    m.fs.fuel_electrode.temperature_x1.display()
-    m.fs.oxygen_electrode.temperature_x1.display()
-    m.fs.fuel_chan.mole_frac_comp.display()
-
-    dhfc = pyo.value(
-        m.fs.fuel_chan.flow_area
-        * (
-            m.fs.fuel_chan.zflux_enth[m.fs.time.last(), m.fs.fuel_chan.izfaces.last()]
-            - m.fs.fuel_chan.zflux_enth[m.fs.time.last(), m.fs.fuel_chan.izfaces.first()]
-        )
-    )
-
-    dhoc = pyo.value(
-        m.fs.oxygen_chan.flow_area
-        * (
-            m.fs.oxygen_chan.zflux_enth[m.fs.time.last(), m.fs.oxygen_chan.izfaces.last()]
-            - m.fs.oxygen_chan.zflux_enth[m.fs.time.last(), m.fs.oxygen_chan.izfaces.first()]
-        )
-    )
-    dmfc = pyo.value(
-        m.fs.fuel_chan.flow_area
-        * sum(
-            m.fs.fuel_chan.zflux[m.fs.time.last(), m.fs.fuel_chan.izfaces.last(), i] * bin_diff_M[i]
-            - m.fs.fuel_chan.zflux[m.fs.time.last(), m.fs.fuel_chan.izfaces.first(), i] * bin_diff_M[i]
-            for i in m.fs.fuel_chan.config.comp_list
-        )
-    )
-    dmoc = pyo.value(
-        m.fs.oxygen_chan.flow_area
-        * sum(
-            m.fs.oxygen_chan.zflux[m.fs.time.last(), m.fs.oxygen_chan.izfaces.last(), i]
-            * bin_diff_M[i]
-            - m.fs.oxygen_chan.zflux[m.fs.time.last(), m.fs.oxygen_chan.izfaces.first(), i]
-            * bin_diff_M[i]
-            for i in m.fs.oxygen_chan.config.comp_list
-        )
-    )
-
-    print(f"Mass Change: {dmfc + dmoc}")
-    print(f"Enthalpy Change: {dhfc + dhoc}")
-    print(
-        f"Electric Power: {pyo.value(sum(m.fs.potential[m.fs.time.last()]*m.fs.electrolyte.current[m.fs.time.last(), iz] for iz in m.fs.electrolyte.iznodes))}"
-    )
-
-    m.fs.h2_production_mass.display()
-    m.fs.fuel_chan.flow_mol_inlet.display()
-
-    check_scaling = False
-    if check_scaling:
-        jac, nlp = iscale.get_jacobian(m, scaled=False)
-        print("Extreme Jacobian entries:")
-        for i in iscale.extreme_jacobian_entries(jac=jac, nlp=nlp, large=100, small=0):
-            print(f"    {i[0]:.2e}, [{i[1]}, {i[2]}]")
-        #print("Badly scaled variables:")
-        #for v, sv in iscale.badly_scaled_var_generator(
-        #    m, large=1e2, small=1e-2, zero=1e-12
-        #):
-        #    print(f"    {v} -- {sv} -- {iscale.get_scaling_factor(v)}")
-        print(f"Jacobian Condition Number: {iscale.jacobian_cond(jac=jac):.2e}")
